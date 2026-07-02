@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""D435i 避障验证程序 (修正版 + 后端集成)
+修复: 箭头方向、俯角补偿符号、栅格图等比显示
+新增: 通过 WebSocket 向后端发送实时控制指令 (steer/speed)
+"""
+
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import math
+import time
+import json
+import threading
+
+
+# ========================== 后端通信配置 ==========================
+class BackendConfig:
+    """WebSocket 后端地址。若不配置则仅本地运行。"""
+    WS_URL = "ws://127.0.0.1:8080/ws/robot"  # 后端 /ws/robot 端点
+    ENABLED = True                           # 是否启用后端发送
+    SEND_INTERVAL = 0.1                      # 最少发送间隔 (s)，避免 30fps 全部发送
+
+
+class BackendClient:
+    """WebSocket 客户端：将 d435i 的实时控制指令发送给后端"""
+
+    def __init__(self, url: str, enabled: bool = True):
+        self.url = url
+        self.enabled = enabled
+        self._ws = None
+        self._connected = False
+        self._last_send = 0.0
+        self._thread = None
+        self._running = False
+
+    def start(self):
+        if not self.enabled:
+            print("[BackendClient] 后端发送已禁用")
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._connected = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    def _connect_loop(self):
+        """使用 asyncio 在线程中运行 WebSocket 客户端"""
+        import asyncio
+        import websockets
+
+        async def run():
+            while self._running:
+                try:
+                    async with websockets.connect(self.url) as ws:
+                        self._ws = ws
+                        self._connected = True
+                        print(f"[BackendClient] ✅ 已连接后端: {self.url}")
+                        # 发送注册消息
+                        await ws.send(json.dumps({"type": "register", "role": "d435i_vision"}))
+                        # 保持连接，只发送不接收
+                        while self._running:
+                            await asyncio.sleep(1.0)
+                except Exception as e:
+                    self._connected = False
+                    print(f"[BackendClient] ❌ 连接失败: {e}，3s 后重连")
+                    await asyncio.sleep(3)
+
+        asyncio.run(run())
+
+    def send_control(self, steer: float, speed: float):
+        """发送实时控制指令"""
+        if not self.enabled or not self._connected or not self._ws:
+            return
+        now = time.time()
+        if now - self._last_send < BackendConfig.SEND_INTERVAL:
+            return
+        self._last_send = now
+        msg = {
+            "type": "control_cmd",
+            "source": "d435i_vfh",
+            "steer": round(steer, 2) if steer is not None else None,
+            "speed": round(speed, 3),
+            "timestamp": now
+        }
+        try:
+            import asyncio
+            # 在线程中异步发送
+            asyncio.run(self._ws.send(json.dumps(msg)))
+        except Exception as e:
+            print(f"[BackendClient] 发送失败: {e}")
+            self._connected = False
+
+
+# ========================== 用户可调参数 ==========================
+class Config:
+    # --- 相机安装参数 ---
+    CAM_HEIGHT = 0.45          # 相机离地面高度 (米)
+    CAM_TILT   = 10.0          # 【正值】= 向下俯角(度)。如相机水平则填 0，向下看 10° 填 10
+
+    # --- 深度处理参数 ---
+    DEPTH_WIDTH  = 640
+    DEPTH_HEIGHT = 480
+    DEPTH_FPS    = 30
+    MAX_DEPTH    = 4.0         # 最大有效深度 (米)
+    MIN_DEPTH    = 0.2         # 过滤相机自身噪声
+
+    # --- 栅格地图参数 ---
+    GRID_RES   = 0.05            # 5cm/格
+    GRID_SIZE  = 80              # 80x80，覆盖前方4m x 左右各2m
+    ROBOT_R    = 0.25            # 机器人半径 (米)，用于膨胀
+    SAFE_DIST  = 0.50            # 前瞻安全距离 (米)
+
+    # --- VFH 决策参数 ---
+    NUM_SECTORS = 36             # -90°~+90°，每扇区5°
+    SECTOR_MIN_WIDTH = 3         # 最窄允许山谷宽度 (3*5°=15°)
+    TARGET_ANGLE = 0.0           # 默认目标方向：正前方
+
+    # --- 速度规划 ---
+    V_FAST  = 0.50
+    V_MID   = 0.30
+    V_SLOW  = 0.15
+    V_BACK  = -0.15
+
+    # --- 可视化 ---
+    GRID_VIS_SIZE = 480          # 栅格图等比显示尺寸
+
+
+# ========================== RealSense 封装 ==========================
+class RealSenseCamera:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(
+            rs.stream.depth, cfg.DEPTH_WIDTH, cfg.DEPTH_HEIGHT, rs.format.z16, cfg.DEPTH_FPS
+        )
+        self.spatial = rs.spatial_filter()
+        self.temporal = rs.temporal_filter()
+        self.hole_filling = rs.hole_filling_filter()
+
+    def start(self):
+        self.profile = self.pipeline.start(self.config)
+        stream_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        intr = stream_profile.get_intrinsics()
+        print(f"[Camera] 已启动: {intr.width}x{intr.height} @ {stream_profile.fps()}fps")
+
+    def stop(self):
+        self.pipeline.stop()
+        print("[Camera] 已关闭")
+
+    def get_filtered_depth(self):
+        frames = self.pipeline.wait_for_frames()
+        depth = frames.get_depth_frame()
+        if not depth:
+            return None
+        d = self.spatial.process(depth)
+        d = self.temporal.process(d)
+        d = self.hole_filling.process(d)
+        return d
+
+
+# ========================== 点云与坐标变换 ==========================
+def depth_to_pointcloud(depth_frame):
+    """深度帧 → Nx3 点云 (x右, y下, z前)"""
+    pc = rs.pointcloud()
+    points = pc.calculate(depth_frame)
+    vtx = np.asanyarray(points.get_vertices())
+    xyz = np.vstack([vtx['f0'], vtx['f1'], vtx['f2']]).T
+    return xyz
+
+
+def compensate_tilt(xyz, tilt_deg):
+    """
+    将相机坐标系点云转换到水平坐标系 (x右, y上, z前)。
+    tilt_deg: 正值 = 相机向下俯角 (度)
+    """
+    t = math.radians(tilt_deg)
+    c, s = math.cos(t), math.sin(t)
+    y, z = xyz[:, 1], xyz[:, 2]
+
+    xyz_new = xyz.copy()
+    # 推导: 先绕X轴旋转俯角，再将Y翻转为向上正
+    xyz_new[:, 1] = -y * c + z * s   # 高度 (向上为正)
+    xyz_new[:, 2] =  y * s + z * c   # 水平前方距离
+    return xyz_new
+
+
+def filter_ground(xyz_level, cam_height, clearance=0.12):
+    """
+    地面分割: 只保留高于地面 clearance 的点。
+    水平坐标系原点在相机中心，地面理论高度 ≈ -cam_height
+    """
+    ground_height = -cam_height
+    return xyz_level[xyz_level[:, 1] > (ground_height + clearance)]
+
+
+# ========================== 栅格地图 ==========================
+def build_occupancy_grid(xyz_level, cfg: Config):
+    """生成已膨胀的2D鸟瞰栅格地图"""
+    grid = np.zeros((cfg.GRID_SIZE, cfg.GRID_SIZE), dtype=np.uint8)
+
+    xz = xyz_level[:, [0, 2]]
+    x, z = xz[:, 0], xz[:, 1]
+
+    half_range = cfg.GRID_SIZE * cfg.GRID_RES / 2.0
+    ix = (x / cfg.GRID_RES + cfg.GRID_SIZE / 2).astype(np.int32)
+    iz = (z / cfg.GRID_RES).astype(np.int32)
+
+    valid = (ix >= 0) & (ix < cfg.GRID_SIZE) & (iz >= 0) & (iz < cfg.GRID_SIZE)
+    ix, iz = ix[valid], iz[valid]
+    grid[iz, ix] = 255
+
+    # 按机器人半径膨胀
+    r_cells = int(np.ceil(cfg.ROBOT_R / cfg.GRID_RES))
+    if r_cells > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_cells * 2 + 1, r_cells * 2 + 1))
+        grid = cv2.dilate(grid, kernel)
+
+    return grid
+
+
+# ========================== VFH 避障决策 ==========================
+def vfh_decision(grid, cfg: Config):
+    """
+    简化VFH。返回: (steer_angle_deg, linear_speed)。
+    steer=None 表示无路可走。
+    """
+    num = cfg.NUM_SECTORS
+    sw = 180.0 / num
+    robot_col = cfg.GRID_SIZE // 2
+    robot_row = 0
+    max_cells = int(cfg.MAX_DEPTH / cfg.GRID_RES)
+
+    # 1. 扫描各扇区最大安全深度
+    sectors = []
+    for i in range(num):
+        angle = -90.0 + i * sw + sw / 2.0
+        rad = math.radians(angle)
+        max_r = 0
+        for r in range(1, max_cells):
+            c = int(robot_col + r * math.sin(rad))
+            r_idx = int(robot_row + r * math.cos(rad))
+            if not (0 <= c < cfg.GRID_SIZE and 0 <= r_idx < cfg.GRID_SIZE):
+                break
+            if grid[r_idx, c] > 0:
+                break
+            max_r = r
+        sectors.append((angle, max_r * cfg.GRID_RES))
+
+    # 2. 阈值过滤
+    threshold = cfg.ROBOT_R + cfg.SAFE_DIST
+    free = [(a, d) for a, d in sectors if d >= threshold]
+
+    if not free:
+        return None, cfg.V_BACK
+
+    # 3. 分组为连续山谷
+    valleys = []
+    cur = [free[0]]
+    for i in range(1, len(free)):
+        if abs(free[i][0] - free[i - 1][0]) < sw * 1.5:
+            cur.append(free[i])
+        else:
+            valleys.append(cur)
+            cur = [free[i]]
+    valleys.append(cur)
+
+    # 4. 选最优山谷
+    best_valley = None
+    best_score = -1e9
+    for valley in valleys:
+        if len(valley) < cfg.SECTOR_MIN_WIDTH:
+            continue
+        center = (valley[0][0] + valley[-1][0]) / 2.0
+        avg_d = sum(d for _, d in valley) / len(valley)
+        score = avg_d * 3.0 + len(valley) * 0.2 - abs(center - cfg.TARGET_ANGLE) * 0.5
+        if score > best_score:
+            best_score = score
+            best_valley = valley
+
+    if best_valley is None:
+        a, d = max(free, key=lambda x: x[1])
+        return a, cfg.V_SLOW
+
+    center_angle = (best_valley[0][0] + best_valley[-1][0]) / 2.0
+    avg_depth = sum(d for _, d in best_valley) / len(best_valley)
+
+    if avg_depth > 2.0:
+        v = cfg.V_FAST
+    elif avg_depth > 1.0:
+        v = cfg.V_MID
+    else:
+        v = cfg.V_SLOW
+
+    return center_angle, v
+
+
+# ========================== 可视化 ==========================
+def visualize(depth_frame, grid, steer, speed, cfg: Config):
+    """
+    左侧: 深度图伪彩色 (640x480)
+    右侧: 等比栅格图 (480x480) + 机器人/方向箭头
+    拼接总尺寸: 1120x480
+    """
+    # --- 左侧深度图 ---
+    depth_img = np.asanyarray(depth_frame.get_data())
+    depth_vis = np.clip(depth_img, 0, int(cfg.MAX_DEPTH * 1000)).astype(np.float32)
+    depth_norm = cv2.convertScaleAbs(depth_vis, alpha=255.0 / (cfg.MAX_DEPTH * 1000))
+    depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
+    # --- 右侧栅格图 (等比缩放，不变形) ---
+    grid_rgb = cv2.cvtColor(grid, cv2.COLOR_GRAY2BGR)
+    # 垂直翻转：栅格数组 row=0 对应 z≈0（机器人附近），显示时机器人应在底部、前方朝上
+    grid_rgb = cv2.flip(grid_rgb, 0)
+    grid_vis = cv2.resize(grid_rgb, (cfg.GRID_VIS_SIZE, cfg.GRID_VIS_SIZE), interpolation=cv2.INTER_NEAREST)
+
+    # 在等比图像上绘制 (避免不等比拉伸导致方向变形)
+    S = cfg.GRID_VIS_SIZE
+    rx = S // 2               # 水平中心
+    ry = int(S * 0.95)        # 底部 95% 处 (留一点边距)
+    arrow_len = int(S * 0.18) # 箭头长度
+
+    # 机器人位置 (绿色圆)
+    cv2.circle(grid_vis, (rx, ry), 10, (0, 255, 0), -1)
+
+    # 决策方向箭头 (红色)
+    if steer is not None:
+        rad = math.radians(steer)
+        # 关键修正: +sin 向右, -cos 向上(图像坐标y向下，前方是上方)
+        lx = int(rx + arrow_len * math.sin(rad))
+        ly = int(ry - arrow_len * math.cos(rad))
+        cv2.arrowedLine(grid_vis, (rx, ry), (lx, ly), (0, 0, 255), 3, tipLength=0.3)
+        info = f"Steer: {steer:+.1f} | V: {speed:+.2f}"
+        color = (0, 255, 255)
+    else:
+        info = "STOP / REVERSE"
+        color = (0, 0, 255)
+
+    cv2.putText(grid_vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    cv2.putText(grid_vis, "Front", (S // 2 - 25, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(grid_vis, "Left", (10, S // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(grid_vis, "Right", (S - 55, S // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    # --- 拼接 ---
+    combined = np.hstack([depth_color, grid_vis])
+    cv2.imshow("D435i Obstacle Avoidance", combined)
+
+
+# ========================== 主程序 ==========================
+def main():
+    cfg = Config()
+    cam = RealSenseCamera(cfg)
+
+    print("=" * 50)
+    print("D435i 避障验证程序 (修正版)")
+    print("按 Q 退出 | 按 S 保存深度帧 | 按 [ / ] 微调俯角")
+    print("=" * 50)
+
+    try:
+        cam.start()
+        frame_count = 0
+        t0 = time.time()
+
+        # 启动后端通信（可选）
+        backend = BackendClient(BackendConfig.WS_URL, BackendConfig.ENABLED)
+        backend.start()
+
+        while True:
+            depth = cam.get_filtered_depth()
+            if depth is None:
+                continue
+
+            # 1. 点云
+            xyz = depth_to_pointcloud(depth)
+            valid = (xyz[:, 2] > cfg.MIN_DEPTH) & (xyz[:, 2] < cfg.MAX_DEPTH)
+            xyz = xyz[valid]
+
+            # 2. 坐标转换 + 地面分割
+            xyz_level = compensate_tilt(xyz, cfg.CAM_TILT)
+            obs = filter_ground(xyz_level, cfg.CAM_HEIGHT, clearance=0.12)
+
+            # 3. 栅格
+            grid = build_occupancy_grid(obs, cfg)
+
+            # 4. 决策
+            steer, speed = vfh_decision(grid, cfg)
+
+            # 4.1 发送控制指令给后端
+            backend.send_control(steer, speed)
+
+            # 5. 可视化
+            visualize(depth, grid, steer, speed, cfg)
+
+            frame_count += 1
+            if frame_count % 30 == 0:
+                fps = frame_count / (time.time() - t0)
+                print(f"[FPS {fps:.1f}] Obs: {len(obs):4d} | Decision: steer={steer}, v={speed}")
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                fname = f"depth_{int(time.time())}.png"
+                cv2.imwrite(fname, np.asanyarray(depth.get_data()))
+                print(f"[Save] {fname}")
+            elif key == ord('['):
+                cfg.CAM_TILT -= 1
+                print(f"[Tilt] {cfg.CAM_TILT}")
+            elif key == ord(']'):
+                cfg.CAM_TILT += 1
+                print(f"[Tilt] {cfg.CAM_TILT}")
+
+    except Exception as e:
+        print("[Error]", e)
+        raise
+    finally:
+        backend.stop()
+        cam.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

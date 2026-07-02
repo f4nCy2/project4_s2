@@ -1,0 +1,17 @@
+# macOS system files
+.DS_Store
+
+# Python virtual environment
+.project4/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Excluded folders
+ppt/
+ppt-report/
+
+# Excluded screen recording video
+屏幕录制*.mp4

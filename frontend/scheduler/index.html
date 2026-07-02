@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Task Scheduler — 任务调度系统</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="logo">
+        <span class="logo-icon">◼</span>
+        <span class="logo-text">TASK SCHEDULER</span>
+      </div>
+      <div class="topbar-center">
+        <span class="conn" id="conn-indicator">
+          <span class="conn-dot" id="conn-dot"></span>
+          <span id="conn-label">连接中...</span>
+        </span>
+      </div>
+      <div class="topbar-right">
+        <a href="/control" class="nav-link">← 控制面板</a>
+        <span class="time" id="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <div class="main">
+      <!-- LEFT: Create Task -->
+      <aside class="sidebar">
+        <div class="panel">
+          <div class="panel-title">创建任务</div>
+          <div class="form-group">
+            <label>任务名称</label>
+            <input type="text" id="task-name-input" placeholder="例如：去客厅拿杯子" value="避障测试任务" />
+          </div>
+          <div class="form-group">
+            <label>优先级</label>
+            <select id="task-priority">
+              <option value="NORMAL">NORMAL</option>
+              <option value="HIGH">HIGH</option>
+              <option value="LOW">LOW</option>
+              <option value="EMERGENCY">EMERGENCY</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>动作序列</label>
+            <div id="action-list">
+              <div class="action-item">
+                <select class="act-type">
+                  <option value="walk_straight">直线行走</option>
+                  <option value="turn_in_place">原地掉头</option>
+                  <option value="turn_walk">转弯行走</option>
+                  <option value="walk_backward">后退</option>
+                  <option value="sidestep">侧移</option>
+                  <option value="stop">停止</option>
+                  <option value="avoid_obstacle">视觉避障</option>
+                </select>
+                <input type="text" class="act-params" placeholder='{"distance":2,"speed":0.8}' value='{"distance":2,"speed":0.8}' />
+                <button class="btn-remove" onclick="this.parentElement.remove()">×</button>
+              </div>
+            </div>
+            <button class="btn-add" onclick="addActionRow()">+ 添加动作</button>
+          </div>
+          <button class="btn-primary" onclick="createTask()">创建任务</button>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">快捷任务</div>
+          <button class="btn-quick" onclick="quickTask('直线行走2m', [{type:'walk_straight',params:{distance:2,speed:0.8}}])">直线行走 2m</button>
+          <button class="btn-quick" onclick="quickTask('左转+直行', [{type:'turn_in_place',params:{angle:45,direction:'left',speed:0.3}},{type:'walk_straight',params:{distance:1,speed:0.8}}])">左转 45° + 直行</button>
+          <button class="btn-quick" onclick="quickTask('避障绕行', [{type:'avoid_obstacle',params:{}}])">视觉避障</button>
+          <button class="btn-quick" onclick="quickTask('紧急停止', [{type:'stop',params:{emergency:true}}])">紧急停止</button>
+        </div>
+      </aside>
+
+      <!-- CENTER: Task List -->
+      <section class="center">
+        <div class="panel">
+          <div class="panel-title">
+            任务队列
+            <span class="panel-actions">
+              <button onclick="refreshTasks()">刷新</button>
+              <button onclick="clearCompleted()">清除已完成</button>
+            </span>
+          </div>
+          <div class="table-wrap">
+            <table class="task-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>名称</th>
+                  <th>状态</th>
+                  <th>优先级</th>
+                  <th>步骤</th>
+                  <th>创建时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="task-tbody">
+                <tr class="empty"><td colspan="7">暂无任务</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">当前任务</div>
+          <div id="current-task-info">
+            <div class="empty-state">暂无运行中的任务</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT: Log -->
+      <aside class="sidebar right">
+        <div class="panel log-panel">
+          <div class="panel-title">调度日志</div>
+          <div class="log-area" id="log-area"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
