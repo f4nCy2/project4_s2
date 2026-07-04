@@ -206,20 +206,33 @@ function updateTask(data) {
 
 function updateVision(data) {
   const panel = document.querySelector('.video-panel');
+  if (!panel) return;  // 安全：如果页面没有视频面板，直接返回
+
   let img = document.getElementById('cam-real');
   const canvas = document.getElementById('cam-canvas');
+
   if (!img) {
     if (canvas) canvas.style.display = 'none';
     img = document.createElement('img');
-    img.id = 'cam-real'; img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:8px;display:block;';
+    img.id = 'cam-real';
+    img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:8px;display:block;';
     panel.insertBefore(img, panel.firstChild);
+  } else {
+    // 显示图片，隐藏 canvas
+    img.style.display = 'block';
+    if (canvas) canvas.style.display = 'none';
   }
-  if (data.frame) img.src = 'data:image/jpeg;base64,' + data.frame;
+
+  if (data.frame) {
+    img.src = 'data:image/jpeg;base64,' + data.frame;
+  }
+
+  const detLabel = document.getElementById('det-label');
   if (data.detections && data.detections.length > 0) {
     const n = data.detections.reduce((m, d) => d.dist < m.dist ? d : m, data.detections[0]);
-    document.getElementById('det-label').textContent = `⚠ ${n.label} ${n.dist.toFixed(2)}m`;
+    if (detLabel) detLabel.textContent = `⚠ ${n.label} ${n.dist.toFixed(2)}m`;
   } else {
-    document.getElementById('det-label').textContent = '';
+    if (detLabel) detLabel.textContent = '';
   }
 }
 

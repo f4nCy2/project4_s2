@@ -21,10 +21,14 @@ class CommandSender:
         self._last_send_time = 0.0
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop_policy().get_event_loop()
 
     def start(self) -> None:
         self._running = True
-        self._task = asyncio.create_task(self._send_loop())
+        self._task = self._loop.create_task(self._send_loop())
 
     def stop(self) -> None:
         self._running = False

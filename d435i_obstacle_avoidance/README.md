@@ -58,17 +58,95 @@ python src/obstacle_avoidance.py
 
 按 `Q` 退出，`S` 保存深度帧，`[`/`]` 微调相机俯角。
 
-### 3.2 运行三区域 ROI / YOLO 避障（规则式）
-```powershell
-python src/obstacle_avoidance_yolo.py
-```
-显示：
-- 上方：RGB 图像 + 左/中/右 ROI 区域标记
-- 下方：深度热力图 + 避障建议文字
-
-可选开启 `USE_YOLO = True`，只分析 YOLOv8 检测到的目标区域。
-
 ---
+
+## 四、机器人底层模拟器（无真机时使用）
+
+如果当前电脑没有真实机器人底盘，可运行 `src/robot_simulator.py` 模拟机器人底层 TCP 服务：
+
+```powershell
+cd d435i_obstacle_avoidance
+$env:ROBOT_HOST = "0.0.0.0"
+$env:ROBOT_PORT = "9090"
+python src/robot_simulator.py
+```
+
+模拟器会：
+- 监听 TCP 端口（默认 9090）
+- 接收并打印后端发来的 `low_level_control`、`command`、`emergency_stop` 指令
+- 回复心跳，保持后端连接存活
+- 定期广播模拟状态（电量、速度、状态等）
+
+### 跨机部署环境变量
+
+D435i 避障程序支持通过环境变量连接远程后端：
+
+```powershell
+$env:D435I_BACKEND_URL = "ws://192.168.1.100:8080/ws/robot"
+python src/obstacle_avoidance.py
+```
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `D435I_BACKEND_URL` | `ws://127.0.0.1:8080/ws/robot` | 后端 `/ws/robot` 端点地址 |
+| `D435I_BACKEND_ENABLED` | `true` | 是否启用后端连接 |
+| `D435I_SEND_INTERVAL` | `0.1` | 控制指令最小发送间隔 (s) |
+
+## 五、机器人端一键启动器（推荐）
+
+跨机部署时，推荐用 `src/robot_side.py` 统一启动三个进程：
+
+```powershell
+cd d435i_obstacle_avoidance
+
+# 默认：robot_simulator + obstacle_avoidance(VFH) + vision_server(RGB)
+$env:D435I_BACKEND_URL = "ws://192.168.1.100:8080/ws/robot"
+$env:VISION_WS_HOST = "0.0.0.0"
+python src/robot_side.py
+
+# 关闭自动重启（调试用）
+$env:ROBOT_AUTO_RESTART = "false"
+python src/robot_side.py
+```
+
+`robot_side.py` 环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `ROBOT_AVOIDANCE` | `vfh` | 启动的避障程序：`vfh`（默认）/ `none` |
+| `ROBOT_ENABLE_VISION` | `true` | 是否启动 `vision_server.py` |
+| `ROBOT_ENABLE_SIM` | `true` | 是否启动 `robot_simulator.py` |
+| `ROBOT_AUTO_RESTART` | `true` | 子进程退出后是否自动重启 |
+
+按 `Ctrl+C` 即可统一关闭所有子进程。
+
+## 六、视觉帧回传（前端摄像头画面）
+
+如果前端 `/control` 需要显示 D435i 实时画面，启动独立的视觉帧服务器：
+
+```powershell
+cd d435i_obstacle_avoidance
+$env:VISION_WS_HOST = "0.0.0.0"
+$env:VISION_WS_PORT = "8765"
+python src/vision_server.py
+```
+
+主控电脑后端通过环境变量连接：
+
+```powershell
+$env:VISION_WS_URL = "ws://192.168.1.200:8765"
+python -m backend.server
+```
+
+环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `VISION_WS_HOST` | `0.0.0.0` | 视觉帧服务器监听地址 |
+| `VISION_WS_PORT` | `8765` | 视觉帧服务器监听端口 |
+| `VISION_FPS` | `10` | 帧率上限 |
+| `VISION_QUALITY` | `70` | JPEG 质量 1-100 |
+| `STREAM_DEPTH` | `false` | 传深度伪彩图而非 RGB |
 
 ## 四、项目结构
 
@@ -77,8 +155,11 @@ d435i_obstacle_avoidance/
 ├── README.md                       # 本文件
 ├── requirements.txt                # Python 依赖
 ├── src/
-│   ├── obstacle_avoidance.py       # 方法 1：点云栅格 + VFH 局部规划
-│   └── obstacle_avoidance_yolo.py  # 方法 2：三区域 ROI 中位数 + 可选 YOLO
+│   ├── obstacle_avoidance.py       # 点云栅格 + VFH 局部规划（主用）
+│   ├── obstacle_avoidance_yolo.py  # 三区域 ROI 中位数 + 可选 YOLO（备用）
+│   ├── robot_simulator.py          # 机器人底层 TCP 模拟器（无真机时用）
+│   ├── robot_side.py               # 一键启动机器人端三件套
+│   └── vision_server.py            # D435i 视觉帧回传服务器
 └── docs/
     ├── algorithm_vfh.md            # VFH 栅格方法原理
     └── algorithm_yolo.md           # 三区域 ROI / YOLO 方法原理
@@ -86,7 +167,7 @@ d435i_obstacle_avoidance/
 
 ---
 
-## 五、避障原理简介
+## 七、避障原理简介
 
 本项目提供两种独立的避障实现，可按需选择：
 
@@ -118,7 +199,7 @@ d435i_obstacle_avoidance/
 
 ---
 
-## 六、参数调节
+## 八、参数调节
 
 ### 方法 1：VFH 栅格避障
 
@@ -147,7 +228,7 @@ YOLO_CONF = 0.35         # YOLO 置信度阈值
 
 ---
 
-## 七、常见问题
+## 九、常见问题
 
 | 问题 | 解决 |
 |------|------|

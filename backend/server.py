@@ -20,6 +20,7 @@ import json
 import time
 import os
 import sys
+from contextlib import asynccontextmanager
 
 # 添加项目根到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,7 +29,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.config import WS_HOST, WS_PORT, VISION_WS_URL, D435I_ENABLED
+from backend.config import WS_HOST, WS_PORT, TCP_HOST, TCP_PORT, VISION_WS_URL, D435I_ENABLED
 from backend.common.models import (
     Command, TaskControlCommand, StatusMessage, TaskEventMessage,
     ObstacleMessage, VisionFrameMessage, AckMessage, ErrorMessage,
@@ -41,7 +42,19 @@ from backend.task_planner.motion_planner import MotionPlanner
 from backend.communication.api_service import APIService
 from backend.vision.vision_bridge import VisionBridge
 
-app = FastAPI(title="人形机器人控制中心", description="三层架构控制后端")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：初始化模块 → 运行 → 清理"""
+    await init_modules_async()
+    yield
+    # 关闭连接
+    if state.apiservice:
+        state.apiservice.disconnect()
+    if state.vision_bridge:
+        state.vision_bridge.stop()
+
+
+app = FastAPI(title="人形机器人控制中心", description="三层架构控制后端", lifespan=lifespan)
 
 # ── 挂载静态文件 ──
 app.mount("/control", StaticFiles(directory="frontend/control", html=True), name="control")
@@ -63,14 +76,17 @@ class ServerState:
 state = ServerState()
 
 # ── 初始化模块 ──
-def init_modules():
-    # 通信层：连接机器人底层 TCP
-    apiservice = APIService(host="127.0.0.1", port=9090)
+async def init_modules_async():
+    # 通信层：连接机器人底层 TCP（后台重连，避免阻塞启动）
+    apiservice = APIService(host=TCP_HOST, port=TCP_PORT)
+    print(f"[Server] 机器人 TCP 目标: {TCP_HOST}:{TCP_PORT}")
     apiservice.set_callbacks(
         on_status=lambda msg: asyncio.create_task(_handle_robot_status(msg)),
         on_task_event=lambda msg: asyncio.create_task(_handle_robot_task_event(msg))
     )
     state.apiservice = apiservice
+    # 在后台任务中尝试连接/重连，不阻塞服务启动
+    asyncio.create_task(_connect_apiservice(apiservice))
 
     # 任务调度层：高层动作序列管理
     scheduler = ActionScheduler(command_sender=apiservice)
@@ -79,17 +95,35 @@ def init_modules():
     state.task_manager = task_manager
 
     # 视觉桥接：从 D435i 接收视觉帧，广播给控制端
-    if D435I_ENABLED:
+    # 如果避障程序已通过 /ws/robot 发送帧，可将 VISION_WS_URL 设为空
+    if D435I_ENABLED and VISION_WS_URL:
         vision = VisionBridge(
             url=VISION_WS_URL,
             on_frame=lambda data: asyncio.create_task(_broadcast_vision(data))
         )
         state.vision_bridge = vision
         vision.start()
+    else:
+        print("[Server] 视觉桥接已禁用（VISION_WS_URL 为空或 D435I_ENABLED=false）")
 
     print("[Server] 所有后端模块初始化完成")
     print("[Server] 避障架构: d435i → VFH → 控制指令 → 后端转发 → TCP → 机器人底层")
     print("[Server] 后端不规划避障路径，只做指令转发和任务调度")
+
+
+async def _connect_apiservice(apiservice: APIService):
+    """后台持续重连机器人 TCP，直到成功"""
+    while True:
+        # 如果 on_dead 已经重连成功，直接退出
+        if apiservice.is_connected():
+            print("[Server] 机器人 TCP 连接成功 (由 on_dead 重连)")
+            break
+        ok = await asyncio.to_thread(apiservice.connect)
+        if ok:
+            print("[Server] 机器人 TCP 连接成功")
+            break
+        print("[Server] 机器人 TCP 连接失败，3s 后重试...")
+        await asyncio.sleep(3.0)
 
 
 async def _handle_robot_status(msg):
@@ -228,6 +262,13 @@ async def ws_robot(websocket: WebSocket):
                     })
                     continue
 
+                # ── d435i 发来的视觉帧 ──
+                if mtype == "vision_frame":
+                    frame_b64 = msg.get("frame", "")
+                    if frame_b64:
+                        await _broadcast_vision({"frame": frame_b64, "type": "vision_frame"})
+                    continue
+
                 # ── d435i 注册消息 ──
                 if mtype == "register":
                     role = msg.get("role", "")
@@ -259,8 +300,10 @@ async def ws_robot(websocket: WebSocket):
             except Exception as e:
                 await websocket.send_json({"type": "error", "message": str(e)})
 
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as e:
+        print(f"[WS] 机器人端断开: code={e.code}, reason={e.reason}")
+    except Exception as e:
+        print(f"[WS] 机器人端异常断开: {type(e).__name__}: {e}")
     finally:
         state.robot_ws_clients.discard(websocket)
         print(f"[WS] 机器人端断开，当前 {len(state.robot_ws_clients)} 个")
@@ -405,11 +448,7 @@ async def api_tasks():
     return {"success": True, "tasks": [t.model_dump() for t in tasks]}
 
 
-# ── 启动 ──
-@app.on_event("startup")
-async def on_startup():
-    init_modules()
-
+# ── 入口 ──
 
 if __name__ == "__main__":
     import uvicorn

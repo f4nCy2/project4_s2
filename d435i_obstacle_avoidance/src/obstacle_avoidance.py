@@ -12,14 +12,18 @@ import math
 import time
 import json
 import threading
+from typing import Optional
 
 
 # ========================== 后端通信配置 ==========================
+import os
+
 class BackendConfig:
-    """WebSocket 后端地址。若不配置则仅本地运行。"""
-    WS_URL = "ws://127.0.0.1:8080/ws/robot"  # 后端 /ws/robot 端点
-    ENABLED = True                           # 是否启用后端发送
-    SEND_INTERVAL = 0.1                      # 最少发送间隔 (s)，避免 30fps 全部发送
+    """WebSocket 后端地址。支持环境变量覆盖，方便跨机部署。"""
+    # 后端 /ws/robot 端点，跨机时改成主控电脑 IP，例如 ws://192.168.1.100:8080/ws/robot
+    WS_URL = os.getenv("D435I_BACKEND_URL", "ws://127.0.0.1:8080/ws/robot")
+    ENABLED = os.getenv("D435I_BACKEND_ENABLED", "true").lower() != "false"
+    SEND_INTERVAL = float(os.getenv("D435I_SEND_INTERVAL", "0.1"))  # 最少发送间隔 (s)
 
 
 class BackendClient:
@@ -33,6 +37,9 @@ class BackendClient:
         self._last_send = 0.0
         self._thread = None
         self._running = False
+        self._loop = None          # 事件循环引用
+        self._send_queue = None    # asyncio.Queue，用于线程安全发送
+        self._last_frame_time = 0.0  # 帧发送限流
 
     def start(self):
         if not self.enabled:
@@ -45,21 +52,32 @@ class BackendClient:
     def stop(self):
         self._running = False
         self._connected = False
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
 
     def _connect_loop(self):
         """使用 asyncio 在线程中运行 WebSocket 客户端"""
         import asyncio
         import websockets
 
-        async def run():
+        async def send_worker():
+            """后台发送任务：从队列中取出消息并发送"""
             while self._running:
                 try:
-                    async with websockets.connect(self.url) as ws:
+                    msg = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
+                    if self._ws and self._connected:
+                        await self._ws.send(msg)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    print(f"[BackendClient] 发送失败: {e}")
+                    self._connected = False
+
+        async def run():
+            self._loop = asyncio.get_running_loop()
+            self._send_queue = asyncio.Queue(maxsize=10)
+            asyncio.create_task(send_worker())
+            while self._running:
+                try:
+                    async with websockets.connect(self.url, ping_interval=None) as ws:
                         self._ws = ws
                         self._connected = True
                         print(f"[BackendClient] ✅ 已连接后端: {self.url}")
@@ -70,33 +88,48 @@ class BackendClient:
                             await asyncio.sleep(1.0)
                 except Exception as e:
                     self._connected = False
-                    print(f"[BackendClient] ❌ 连接失败: {e}，3s 后重连")
+                    print(f"[BackendClient] ❌ 连接断开: {e}，3s 后重连")
                     await asyncio.sleep(3)
 
         asyncio.run(run())
 
+    def send_frame(self, frame_b64: str):
+        """发送视觉帧给后端（线程安全，限流 5fps）"""
+        if not self.enabled or not self._connected or not self._ws or not self._loop:
+            return
+        now = time.time()
+        if now - self._last_frame_time < 0.2:  # 最多 5fps
+            return
+        self._last_frame_time = now
+        msg = json.dumps({
+            "type": "vision_frame",
+            "frame": frame_b64,
+            "timestamp": now
+        })
+        try:
+            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, msg)
+        except Exception as e:
+            print(f"[BackendClient] 帧入队失败: {e}")
+
     def send_control(self, steer: float, speed: float):
-        """发送实时控制指令"""
-        if not self.enabled or not self._connected or not self._ws:
+        """发送实时控制指令（线程安全）"""
+        if not self.enabled or not self._connected or not self._ws or not self._loop:
             return
         now = time.time()
         if now - self._last_send < BackendConfig.SEND_INTERVAL:
             return
         self._last_send = now
-        msg = {
+        msg = json.dumps({
             "type": "control_cmd",
             "source": "d435i_vfh",
             "steer": round(steer, 2) if steer is not None else None,
             "speed": round(speed, 3),
             "timestamp": now
-        }
+        })
         try:
-            import asyncio
-            # 在线程中异步发送
-            asyncio.run(self._ws.send(json.dumps(msg)))
+            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, msg)
         except Exception as e:
-            print(f"[BackendClient] 发送失败: {e}")
-            self._connected = False
+            print(f"[BackendClient] 控制指令入队失败: {e}")
 
 
 # ========================== 用户可调参数 ==========================
@@ -142,29 +175,55 @@ class RealSenseCamera:
         self.config.enable_stream(
             rs.stream.depth, cfg.DEPTH_WIDTH, cfg.DEPTH_HEIGHT, rs.format.z16, cfg.DEPTH_FPS
         )
+        self.config.enable_stream(
+            rs.stream.color, cfg.DEPTH_WIDTH, cfg.DEPTH_HEIGHT, rs.format.bgr8, cfg.DEPTH_FPS
+        )
         self.spatial = rs.spatial_filter()
         self.temporal = rs.temporal_filter()
         self.hole_filling = rs.hole_filling_filter()
+        self._align = rs.align(rs.stream.color)
+        self._encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
 
     def start(self):
         self.profile = self.pipeline.start(self.config)
-        stream_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
-        intr = stream_profile.get_intrinsics()
-        print(f"[Camera] 已启动: {intr.width}x{intr.height} @ {stream_profile.fps()}fps")
+        depth_stream = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        print(f"[Camera] 已启动: depth={depth_stream.width()}x{depth_stream.height()} | color={color_stream.width()}x{color_stream.height()}")
 
     def stop(self):
         self.pipeline.stop()
         print("[Camera] 已关闭")
 
-    def get_filtered_depth(self):
-        frames = self.pipeline.wait_for_frames()
-        depth = frames.get_depth_frame()
-        if not depth:
-            return None
+    def get_frames(self):
+        """获取对齐后的彩色帧和深度帧"""
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=10000)
+        except RuntimeError as e:
+            print(f"[Camera] 获取帧超时: {e}")
+            return None, None
+        aligned = self._align.process(frames)
+        depth = aligned.get_depth_frame()
+        color = aligned.get_color_frame()
+        if not depth or not color:
+            return None, None
         d = self.spatial.process(depth)
         d = self.temporal.process(d)
         d = self.hole_filling.process(d)
-        return d
+        return color, d
+
+    def get_filtered_depth(self):
+        _, depth = self.get_frames()
+        return depth
+
+    def encode_color_frame(self, color_frame) -> Optional[str]:
+        """将彩色帧编码为 JPEG base64"""
+        if not color_frame:
+            return None
+        img = np.asanyarray(color_frame.get_data())
+        ret, buf = cv2.imencode(".jpg", img, self._encode_param)
+        if not ret:
+            return None
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
 # ========================== 点云与坐标变换 ==========================
@@ -374,11 +433,17 @@ def main():
         backend.start()
 
         while True:
-            depth = cam.get_filtered_depth()
+            # 同时获取彩色帧和深度帧
+            color_frame, depth = cam.get_frames()
             if depth is None:
                 continue
 
-            # 1. 点云
+            # 编码彩色帧并发送给后端（用于前端视频显示）
+            frame_b64 = cam.encode_color_frame(color_frame)
+            if frame_b64:
+                backend.send_frame(frame_b64)
+
+            # 1. 点云（深度帧）
             xyz = depth_to_pointcloud(depth)
             valid = (xyz[:, 2] > cfg.MIN_DEPTH) & (xyz[:, 2] < cfg.MAX_DEPTH)
             xyz = xyz[valid]
