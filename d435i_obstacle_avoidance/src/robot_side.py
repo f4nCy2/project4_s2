@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 """机器人端一键启动器
 
-把 D435i 电脑上的三个进程统一起跑：
+把 D435i 电脑上的进程统一起跑：
   1. robot_simulator.py  - 模拟机器人底层（TCP 9090）
-  2. vision_server.py    - D435i 视频流回传（WS 8765）
-  3. obstacle_avoidance*.py - 视觉避障算法（向后端发 control_cmd）
+  2. obstacle_avoidance*.py - 视觉避障算法（向后端发 control_cmd / vision_frame）
 
 用法：
     cd d435i_obstacle_avoidance
@@ -13,9 +12,8 @@
 
 环境变量：
     ROBOT_AVOIDANCE       - 启动哪个避障程序：vfh / yolo / none，默认 vfh
-    ROBOT_ENABLE_VISION   - 是否启动 vision_server，默认 true
     ROBOT_ENABLE_SIM      - 是否启动 robot_simulator，默认 true
-    其余环境变量（TCP_HOST、VISION_WS_URL 等）会透传给子进程
+    其余环境变量（TCP_HOST 等）会透传给子进程
 """
 
 import os
@@ -32,7 +30,6 @@ _shutting_down = False
 
 
 ROBOT_AVOIDANCE = os.getenv("ROBOT_AVOIDANCE", "vfh").lower()
-ROBOT_ENABLE_VISION = os.getenv("ROBOT_ENABLE_VISION", "true").lower() == "true"
 ROBOT_ENABLE_SIM = os.getenv("ROBOT_ENABLE_SIM", "true").lower() == "true"
 AUTO_RESTART = os.getenv("ROBOT_AUTO_RESTART", "true").lower() == "true"
 
@@ -108,12 +105,6 @@ def build_processes():
             [sys.executable, "-u", str(SRC_DIR / "robot_simulator.py")]
         ))
 
-    if ROBOT_ENABLE_VISION:
-        processes.append(ProcessWrapper(
-            "Vision",
-            [sys.executable, "-u", str(SRC_DIR / "vision_server.py")]
-        ))
-
     if ROBOT_AVOIDANCE == "vfh":
         processes.append(ProcessWrapper(
             "AvoidVFH",
@@ -145,7 +136,6 @@ def main():
     print("  机器人端一键启动器")
     print("=" * 60)
     print(f"  避障程序: {ROBOT_AVOIDANCE}")
-    print(f"  视觉回传: {'开启' if ROBOT_ENABLE_VISION else '关闭'}")
     print(f"  底层模拟: {'开启' if ROBOT_ENABLE_SIM else '关闭'}")
     print(f"  工作目录: {ROOT_DIR}")
     print("=" * 60)
@@ -188,7 +178,7 @@ def main():
                     else:
                         print(f"[RobotSide] ⚠️ {p.name} 已退出")
                         # 如果是核心进程退出，结束全部
-                        if p.name in ("RobotSim", "Vision"):
+                        if p.name == "RobotSim":
                             print("[RobotSide] 核心进程退出，关闭整个机器人端")
                             shutdown(None, None)
                             return 1
