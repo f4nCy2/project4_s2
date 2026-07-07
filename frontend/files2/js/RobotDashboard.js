@@ -57,6 +57,8 @@ const Dashboard = (() => {
     if (label) label.textContent = '连接中...';
 
     try {
+      // 如果配置的是后端 /ws/control，则接收 type=vision_frame, frame=base64
+      // 如果直连 D435i vision_server:8765，则接收 frame_b64=base64
       _ws = new WebSocket(CONFIG.WS_URL);
 
       _ws.onopen = () => {
@@ -73,11 +75,17 @@ const Dashboard = (() => {
       };
 
       _ws.onmessage = (event) => {
+        let data;
         try {
-          const data = JSON.parse(event.data);
+          data = JSON.parse(event.data);
+        } catch (e) {
+          LogSystem.warning('Dashboard', '收到非JSON消息: ' + String(event.data).slice(0, 200));
+          return;
+        }
+        try {
           _handleMessage(data);
         } catch (e) {
-          LogSystem.warning('Dashboard', '收到非JSON消息: ' + event.data);
+          LogSystem.error('Dashboard', `消息处理异常 type=${data && data.type}: ${e.message}`);
         }
       };
 
@@ -187,9 +195,27 @@ const Dashboard = (() => {
       LogSystem.info('Dashboard', '已切换到真实摄像头画面');
     }
 
-    if (frameData.frame) {
-      img.src = 'data:image/jpeg;base64,' + frameData.frame;
+    const frame = frameData.frame || frameData.frame_b64 || '';
+    if (!frame) {
+      LogSystem.warning('Dashboard', '收到空视频帧');
+      return;
     }
+    if (!/^[A-Za-z0-9+/=]+$/.test(frame)) {
+      LogSystem.warning('Dashboard', `视频帧包含非法 base64 字符，长度=${frame.length}`);
+      return;
+    }
+
+    img.onerror = () => {
+      LogSystem.error('Dashboard', '图片解码失败，帧长度=' + frame.length);
+    };
+    img.onload = () => {
+      if (!img.dataset.reported) {
+        LogSystem.info('Dashboard', `视频帧首次渲染成功，长度=${frame.length}`);
+        img.dataset.reported = '1';
+      }
+    };
+
+    img.src = 'data:image/jpeg;base64,' + frame;
 
     // 障碍物检测框叠加显示
     if (frameData.detections && frameData.detections.length > 0) {

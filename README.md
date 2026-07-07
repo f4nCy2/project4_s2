@@ -204,7 +204,9 @@ python src/vision_server.py
 | `VISION_WS_PORT` | `8765` | 机器人电脑 | 视觉帧服务器监听端口 |
 | `VISION_FPS` | `10` | 机器人电脑 | 视觉帧回传帧率上限 |
 | `VISION_QUALITY` | `70` | 机器人电脑 | JPEG 质量 1-100 |
+| `VISION_MAX_FRAME_BYTES` | `1048576` | 机器人电脑 | 单帧 JPEG 原始大小上限（字节） |
 | `STREAM_DEPTH` | `false` | 机器人电脑 | 是否回传深度伪彩图 |
+| `WS_MAX_SIZE` | `8388608` | 主控电脑 | 前后端 WebSocket 单消息大小上限（字节） |
 | `ROBOT_AVOIDANCE` | `vfh` | 机器人电脑 | robot_side 启动的避障程序：`vfh` / `none` |
 | `ROBOT_ENABLE_VISION` | `true` | 机器人电脑 | robot_side 是否启动 vision_server |
 | `ROBOT_ENABLE_SIM` | `true` | 机器人电脑 | robot_side 是否启动 robot_simulator |
@@ -251,6 +253,7 @@ python src/vision_server.py
 | `TCP_PORT` | `9090` | 机器人底层 TCP 端口 |
 | `VISION_WS_URL` | `ws://127.0.0.1:8765` | D435i 视觉算法 WebSocket 地址 |
 | `D435I_ENABLED` | `true` | 是否启用 D435i 视觉连接 |
+| `WS_MAX_SIZE` | `8388608` | 前后端 WebSocket 单消息大小上限（字节），影响视频帧传输 |
 
 ---
 

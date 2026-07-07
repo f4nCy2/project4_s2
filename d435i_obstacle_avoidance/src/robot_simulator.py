@@ -167,6 +167,21 @@ class RobotSimulator:
                 "status": {
                     "state": self._state,
                     "battery": 85.0,
+                    "position": [0.0, 0.0],
+                    "orientation": [0.0, 0.0, 0.0],
+                    "velocity": self._speed,
+                    "error_code": 0,
+                    "cpu": 15.0,
+                    "obstacle_dist": None,
+                    "joints": {},
+                    "connected": True,
+                    "timestamp": time.time()
+                }
+            }
+                "type": "status",
+                "status": {
+                    "state": self._state,
+                    "battery": 85.0,
                     "position": {"x": 0.0, "y": 0.0, "z": 0.0},
                     "orientation": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
                     "velocity": self._speed,

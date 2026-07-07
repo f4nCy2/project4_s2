@@ -22,10 +22,5 @@ COMMAND_RATE_LIMIT = 10   # Hz
 # UI 刷新
 UI_REFRESH_RATE = 10      # Hz
 
-# D435i
-# 视觉帧流地址。跨机部署时改为 D435i 电脑 IP，例如 ws://192.168.1.200:8765
-VISION_WS_URL = os.getenv("VISION_WS_URL", "ws://192.168.1.2:8765")
-D435I_ENABLED = os.getenv("D435I_ENABLED", "true").lower() == "true"
-
 # 任务
 TASK_MAX_QUEUE = 100

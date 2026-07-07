@@ -84,7 +84,19 @@ function connect() {
       heartbeatTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'heartbeat', seq:++seq, ts:Date.now()})); }, 5000);
     };
     ws.onmessage = (e) => {
-      try { handleMessage(JSON.parse(e.data)); } catch (err) { log('WARN', 'WS', '解析失败'); }
+      let data;
+      try {
+        data = JSON.parse(e.data);
+      } catch (err) {
+        const preview = String(e.data).slice(0, 200);
+        log('WARN', 'WS', `JSON 解析失败: ${err.message} | 预览: ${preview}`);
+        return;
+      }
+      try {
+        handleMessage(data);
+      } catch (err) {
+        log('ERROR', 'WS', `消息处理异常 type=${data && data.type}: ${err.message}`);
+      }
     };
     ws.onerror = () => { log('WARN', 'WS', '连接错误'); startMock(); };
     ws.onclose = () => {
@@ -123,11 +135,23 @@ function updateStatus(s) {
   if (s.cpu !== undefined) robot.cpu = s.cpu;
   if (s.velocity !== undefined) robot.speed = s.velocity;
   if (s.position !== undefined) {
-    const [x, y] = s.position;
-    robot.dist = Math.sqrt(x*x + y*y);
+    if (Array.isArray(s.position)) {
+      const [x, y] = s.position;
+      robot.dist = Math.sqrt(x*x + y*y);
+    } else if (s.position && typeof s.position === 'object') {
+      const x = s.position.x || 0;
+      const y = s.position.y || 0;
+      robot.dist = Math.sqrt(x*x + y*y);
+    }
   }
   if (s.orientation !== undefined) {
-    [robot.roll, robot.pitch, robot.yaw] = s.orientation;
+    if (Array.isArray(s.orientation)) {
+      [robot.roll, robot.pitch, robot.yaw] = s.orientation;
+    } else if (s.orientation && typeof s.orientation === 'object') {
+      robot.roll = s.orientation.roll || 0;
+      robot.pitch = s.orientation.pitch || 0;
+      robot.yaw = s.orientation.yaw || 0;
+    }
   }
   if (s.obstacle_dist !== undefined) robot.obstacle = s.obstacle_dist;
   if (s.joints !== undefined) robot.joints = s.joints;
@@ -206,7 +230,18 @@ function updateTask(data) {
 
 function updateVision(data) {
   const panel = document.querySelector('.video-panel');
-  if (!panel) return;  // 安全：如果页面没有视频面板，直接返回
+  if (!panel) return;
+
+  const frame = data.frame || data.frame_b64 || '';
+  if (!frame) {
+    log('WARN', 'Vision', '收到空视频帧');
+    return;
+  }
+
+  if (!/^[A-Za-z0-9+/=]+$/.test(frame)) {
+    log('WARN', 'Vision', `视频帧包含非法 base64 字符，长度=${frame.length}`);
+    return;
+  }
 
   let img = document.getElementById('cam-real');
   const canvas = document.getElementById('cam-canvas');
@@ -215,17 +250,24 @@ function updateVision(data) {
     if (canvas) canvas.style.display = 'none';
     img = document.createElement('img');
     img.id = 'cam-real';
+    img.alt = 'D435i 实时画面';
     img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:8px;display:block;';
+    img.onerror = () => {
+      log('ERROR', 'Vision', '图片解码失败，帧长度=' + frame.length);
+    };
+    img.onload = () => {
+      if (!img.dataset.reported) {
+        log('INFO', 'Vision', `视频帧首次渲染成功，长度=${frame.length}`);
+        img.dataset.reported = '1';
+      }
+    };
     panel.insertBefore(img, panel.firstChild);
   } else {
-    // 显示图片，隐藏 canvas
     img.style.display = 'block';
     if (canvas) canvas.style.display = 'none';
   }
 
-  if (data.frame) {
-    img.src = 'data:image/jpeg;base64,' + data.frame;
-  }
+  img.src = 'data:image/jpeg;base64,' + frame;
 
   const detLabel = document.getElementById('det-label');
   if (data.detections && data.detections.length > 0) {

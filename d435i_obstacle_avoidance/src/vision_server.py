@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """D435i 视觉帧回传服务器
 
-把 D435i 的彩色或深度图编码为 JPEG，通过 WebSocket 广播给后端 VisionBridge，
+把 D435i 的彩色或深度图编码为 JPEG，通过 WebSocket 广播给后端，
 最终显示在前端 /control 的摄像头画面区域。
+
+后端通过 /ws/robot 接收视觉帧，不再使用独立的 VisionBridge 模块。
 
 用法（跑在带 D435i 的电脑上）：
     python src/vision_server.py
@@ -14,9 +16,6 @@
     VISION_FPS       - 帧率上限，默认 10
     VISION_QUALITY   - JPEG 质量 1-100，默认 70
     STREAM_DEPTH     - 是否传深度伪彩图，默认 false（传 RGB）
-
-后端连接：
-    主控电脑设置 VISION_WS_URL=ws://<D435i电脑IP>:8765
 """
 
 import os
@@ -43,6 +42,7 @@ VISION_FPS = int(os.getenv("VISION_FPS", "10"))
 VISION_QUALITY = int(os.getenv("VISION_QUALITY", "70"))
 STREAM_DEPTH = os.getenv("STREAM_DEPTH", "false").lower() == "true"
 VISION_CAMERA_ENABLED = os.getenv("VISION_CAMERA_ENABLED", "true").lower() == "true"
+VISION_MAX_FRAME_BYTES = int(os.getenv("VISION_MAX_FRAME_BYTES", "1048576"))  # 1MB，防止单帧过大
 
 WIDTH, HEIGHT, FPS = 640, 480, 30
 
@@ -61,8 +61,9 @@ class VisionServer:
         try:
             # 连上后立即发一帧，减少前端等待
             with self._lock:
-                if self.frame_b64:
-                    await websocket.send(json.dumps({"frame_b64": self.frame_b64}))
+                frame = self.frame_b64
+                if frame:
+                    await websocket.send(json.dumps({"frame_b64": frame}))
             await websocket.wait_closed()
         except Exception as e:
             print(f"[VisionServer] 客户端异常: {e}")
@@ -144,7 +145,12 @@ class VisionServer:
                 if not ret:
                     continue
 
-                b64 = base64.b64encode(buf).decode("utf-8")
+                # 必须 tobytes()，部分 numpy 版本直接传 ndarray给 b64encode 会异常
+                b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+                # 简单校验，剔除异常大帧，避免 WebSocket 被撑爆
+                if len(b64) > VISION_MAX_FRAME_BYTES * 4 // 3:
+                    print(f"[VisionServer] ⚠️ 帧过大({len(b64)} b64 chars)，已跳过")
+                    continue
                 with self._lock:
                     self.frame_b64 = b64
 

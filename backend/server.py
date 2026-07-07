@@ -20,6 +20,8 @@ import json
 import time
 import os
 import sys
+import re
+import base64
 from contextlib import asynccontextmanager
 
 # 添加项目根到路径
@@ -29,7 +31,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.config import WS_HOST, WS_PORT, TCP_HOST, TCP_PORT, VISION_WS_URL, D435I_ENABLED
+from backend.config import WS_HOST, WS_PORT, TCP_HOST, TCP_PORT
 from backend.common.models import (
     Command, TaskControlCommand, StatusMessage, TaskEventMessage,
     ObstacleMessage, VisionFrameMessage, AckMessage, ErrorMessage,
@@ -40,7 +42,6 @@ from backend.task_planner.task_manager import TaskManager
 from backend.task_planner.action_scheduler import ActionScheduler
 from backend.task_planner.motion_planner import MotionPlanner
 from backend.communication.api_service import APIService
-from backend.vision.vision_bridge import VisionBridge
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,8 +51,6 @@ async def lifespan(app: FastAPI):
     # 关闭连接
     if state.apiservice:
         state.apiservice.disconnect()
-    if state.vision_bridge:
-        state.vision_bridge.stop()
 
 
 app = FastAPI(title="人形机器人控制中心", description="三层架构控制后端", lifespan=lifespan)
@@ -68,12 +67,30 @@ class ServerState:
         self.robot_ws_clients: set = set()  # d435i / 机器人底层
         self.apiservice: Optional[APIService] = None
         self.task_manager: Optional[TaskManager] = None
-        self.vision_bridge: Optional[VisionBridge] = None
         self.robot_status = RobotStatus()
         self._seq = 0
         self._avoidance_mode = False  # 是否由 d435i 接管避障控制
 
 state = ServerState()
+
+# base64 简单校验正则
+_B64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _is_valid_frame(frame: str) -> bool:
+    """校验视频帧 base64 字符串是否合法"""
+    if not isinstance(frame, str) or not frame:
+        return False
+    if len(frame) > 4 * 1024 * 1024:  # 4MB b64 上限
+        return False
+    if not _B64_RE.match(frame):
+        return False
+    # 进一步校验能否解码
+    try:
+        base64.b64decode(frame, validate=True)
+    except Exception:
+        return False
+    return True
 
 # ── 初始化模块 ──
 async def init_modules_async():
@@ -93,18 +110,6 @@ async def init_modules_async():
     task_manager = TaskManager(scheduler=scheduler)
     task_manager.subscribe_task_events(lambda evt: asyncio.create_task(_broadcast_task_event(evt)))
     state.task_manager = task_manager
-
-    # 视觉桥接：从 D435i 接收视觉帧，广播给控制端
-    # 如果避障程序已通过 /ws/robot 发送帧，可将 VISION_WS_URL 设为空
-    if D435I_ENABLED and VISION_WS_URL:
-        vision = VisionBridge(
-            url=VISION_WS_URL,
-            on_frame=lambda data: asyncio.create_task(_broadcast_vision(data))
-        )
-        state.vision_bridge = vision
-        vision.start()
-    else:
-        print("[Server] 视觉桥接已禁用（VISION_WS_URL 为空或 D435I_ENABLED=false）")
 
     print("[Server] 所有后端模块初始化完成")
     print("[Server] 避障架构: d435i → VFH → 控制指令 → 后端转发 → TCP → 机器人底层")
@@ -128,7 +133,19 @@ async def _connect_apiservice(apiservice: APIService):
 
 async def _handle_robot_status(msg):
     """处理机器人底层状态上报"""
-    status = RobotStatus(**msg.get("status", {}))
+    raw = msg.get("status", {})
+
+    # 兼容数组格式的 position/orientation（robot_simulator.py 发送 [x,y] / [r,p,y]）
+    def _normalize(val, keys):
+        if isinstance(val, list):
+            return dict(zip(keys, val))
+        return val
+
+    raw = dict(raw)  # 避免修改原 dict
+    raw["position"] = _normalize(raw.get("position"), ["x", "y", "z"])
+    raw["orientation"] = _normalize(raw.get("orientation"), ["roll", "pitch", "yaw"])
+
+    status = RobotStatus(**raw)
     state.robot_status = status
     await _broadcast_control({"type": "status", "status": status.model_dump()})
 
@@ -146,7 +163,11 @@ async def _broadcast_task_event(evt: dict):
 
 async def _broadcast_vision(data: dict):
     """广播视觉帧给控制端"""
-    await _broadcast_control({"type": "vision_frame", "frame": data.get("frame", "")})
+    frame = data.get("frame", "")
+    if not _is_valid_frame(frame):
+        print(f"[Server] ⚠️ 收到非法视频帧，长度={len(frame) if isinstance(frame, str) else 'N/A'}，已丢弃")
+        return
+    await _broadcast_control({"type": "vision_frame", "frame": frame})
 
 
 async def _broadcast_control(payload: dict):
@@ -265,8 +286,10 @@ async def ws_robot(websocket: WebSocket):
                 # ── d435i 发来的视觉帧 ──
                 if mtype == "vision_frame":
                     frame_b64 = msg.get("frame", "")
-                    if frame_b64:
+                    if _is_valid_frame(frame_b64):
                         await _broadcast_vision({"frame": frame_b64, "type": "vision_frame"})
+                    else:
+                        print(f"[WS/robot] ⚠️ 收到非法视频帧，长度={len(frame_b64) if isinstance(frame_b64, str) else 'N/A'}，已丢弃")
                     continue
 
                 # ── d435i 注册消息 ──
@@ -452,4 +475,6 @@ async def api_tasks():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=WS_HOST, port=WS_PORT)
+    # ws_max_size: 允许前后端之间传输大视频帧（单位：字节）
+    WS_MAX_SIZE = int(os.getenv("WS_MAX_SIZE", str(8 * 1024 * 1024)))
+    uvicorn.run(app, host=WS_HOST, port=WS_PORT, ws_max_size=WS_MAX_SIZE)

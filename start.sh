@@ -34,4 +34,7 @@ echo "   调度界面: http://127.0.0.1:8080/scheduler"
 echo "   API:      http://127.0.0.1:8080/"
 echo ""
 
+# WebSocket 单消息大小上限，影响前后端之间传输的视频帧
+export WS_MAX_SIZE="${WS_MAX_SIZE:-8388608}"
+
 python3 -m backend.server
