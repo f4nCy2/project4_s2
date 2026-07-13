@@ -187,6 +187,13 @@ async def _handle_robot_status(msg):
     if avoid_evt:
         await _handle_avoidance_event(avoid_evt)
 
+    # ── 2D 导航：导航完成 ──
+    nav_completed = msg.get("nav_completed")
+    if nav_completed:
+        completed = state.slam.complete_task()
+        if completed:
+            await _broadcast_nav_update(completed)
+
 
 async def _handle_robot_task_event(msg):
     """处理机器人任务事件"""

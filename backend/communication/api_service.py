@@ -82,15 +82,9 @@ class APIService:
                 if self._on_status:
                     self._on_status({"type": "status", "status": {}, "avoidance_event": msg})
             elif mtype == "nav_task_completed":
-                # 导航任务完成
+                # 导航任务完成 — 通过 on_status 路由
                 if self._on_status:
-                    self._on_status({"type": "status", "status": {}, "nav_position": {
-                        "current_x": msg.get("final_x", 0),
-                        "current_y": msg.get("final_y", 0),
-                        "yaw": msg.get("final_yaw", 0),
-                        "distance_to_target": 0.0,
-                        "status": "completed",
-                    }})
+                    self._on_status({"type": "status", "status": {}, "nav_completed": msg})
         except Exception as e:
             print(f"[APIService] 消息解析失败: {e}")
 
