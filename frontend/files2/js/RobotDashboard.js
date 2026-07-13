@@ -151,6 +151,38 @@ const Dashboard = (() => {
       case 'heartbeat':
         break;
 
+      // ── 2D SLAM 导航：位置更新 ──
+      case 'nav_position_update':
+        StatusManager.updateNavPosition(data);
+        LogSystem.info('Nav', `坐标: (${data.current_x.toFixed(2)}, ${data.current_y.toFixed(2)}) 距终点: ${data.distance_to_target.toFixed(2)}m 进度: ${(data.progress*100).toFixed(0)}%`);
+        break;
+
+      // ── 2D SLAM 导航：避障事件 ──
+      case 'avoidance_event':
+        LogSystem.warning('Nav', `避障: 左转${data.turn_angle}°+前进${data.forward_distance}m → (${data.new_x}, ${data.new_y}) 剩余${data.remaining_distance}m`);
+        ObstacleAvoidance.triggerAvoid(data.remaining_distance);
+        break;
+
+      // ── 2D SLAM 导航：任务完成 ──
+      case 'nav_task_completed':
+        LogSystem.info('Nav', `✅ 导航完成: ${data.task_name} → ${data.target_location} | ${data.total_steps}步 ${data.avoidance_count}次避障`);
+        break;
+
+      // ── 2D SLAM 导航：任务摘要 ──
+      case 'nav_task_summary':
+        if (data.active) {
+          StatusManager.updateNavPosition({
+            current_x: data.current.x,
+            current_y: data.current.y,
+            yaw: data.yaw,
+            distance_to_target: data.distance_to_target,
+            progress: data.progress,
+            status: data.status,
+            step: data.step_count
+          });
+        }
+        break;
+
       default:
         LogSystem.info('Dashboard', `未知消息类型: ${data.type}`);
     }

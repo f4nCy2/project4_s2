@@ -26,13 +26,43 @@
     </header>
 
     <div class="main">
-      <!-- LEFT: Create Task -->
+      <!-- LEFT: NLP Task + Manual Create -->
       <aside class="sidebar">
+        <!-- 自然语言任务 -->
         <div class="panel">
-          <div class="panel-title">创建任务</div>
+          <div class="panel-title">🗣 自然语言任务 (2D SLAM)</div>
+          <div class="form-group">
+            <label>任务描述</label>
+            <input type="text" id="nlp-input" placeholder="例如：去客厅拿杯子、前往卧室取物品" value="去客厅拿杯子" />
+          </div>
+          <div class="form-group">
+            <label>当前位置</label>
+            <select id="nlp-current-location">
+              <option value="客厅">客厅 (0, 0)</option>
+              <option value="卧室">卧室 (5, 3)</option>
+              <option value="玄关">玄关 (1.5, -2)</option>
+              <option value="厨房">厨房 (-3, 2.5)</option>
+              <option value="走廊">走廊 (2, 0)</option>
+              <option value="卫生间">卫生间 (6, -1.5)</option>
+              <option value="阳台">阳台 (-2, 5)</option>
+            </select>
+          </div>
+          <button class="btn-primary" onclick="sendNLPTask()">🚀 解析并下发导航任务</button>
+          <div class="nlp-result" id="nlp-result" style="display:none;">
+            <div class="nlp-title" id="nlp-task-name"></div>
+            <div class="nlp-coords">
+              <div><span class="coord-label">起点:</span> <span id="nlp-start"></span></div>
+              <div><span class="coord-label">终点:</span> <span id="nlp-target"></span></div>
+              <div><span class="coord-label">航向:</span> <span id="nlp-yaw"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">创建动作任务</div>
           <div class="form-group">
             <label>任务名称</label>
-            <input type="text" id="task-name-input" placeholder="例如：去客厅拿杯子" value="避障测试任务" />
+            <input type="text" id="task-name-input" placeholder="例如：避障测试任务" value="避障测试任务" />
           </div>
           <div class="form-group">
             <label>优先级</label>
@@ -74,8 +104,48 @@
         </div>
       </aside>
 
-      <!-- CENTER: Task List -->
+      <!-- CENTER: Nav Status + Task List -->
       <section class="center">
+        <!-- 2D 导航状态 -->
+        <div class="panel">
+          <div class="panel-title">
+            📍 2D 导航状态
+            <span class="panel-actions">
+              <button onclick="refreshNavSummary()">刷新</button>
+              <button onclick="cancelNavTask()" style="background:#ef4444;color:#fff;">取消导航</button>
+            </span>
+          </div>
+          <div id="nav-status-area">
+            <div class="empty-state">暂无活跃导航任务</div>
+          </div>
+        </div>
+
+        <!-- 2D 坐标实时显示 -->
+        <div class="panel">
+          <div class="panel-title">📐 实时坐标追踪</div>
+          <div class="coord-tracker" id="coord-tracker">
+            <div class="coord-row">
+              <span class="coord-label">当前坐标:</span>
+              <span class="coord-val" id="live-x">--</span>, <span class="coord-val" id="live-y">--</span>
+            </div>
+            <div class="coord-row">
+              <span class="coord-label">航向角:</span>
+              <span class="coord-val" id="live-yaw">--</span>°
+            </div>
+            <div class="coord-row">
+              <span class="coord-label">距终点:</span>
+              <span class="coord-val" id="live-dist">--</span>m
+            </div>
+            <div class="coord-row">
+              <span class="coord-label">进度:</span>
+              <span class="coord-val" id="live-progress">0</span>%
+            </div>
+            <div class="nav-progress-track">
+              <div class="nav-progress-bar" id="nav-progress-bar" style="width:0%"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-title">
             任务队列
@@ -112,8 +182,15 @@
         </div>
       </section>
 
-      <!-- RIGHT: Log -->
+      <!-- RIGHT: Execution Log + Avoidance Log -->
       <aside class="sidebar right">
+        <div class="panel">
+          <div class="panel-title">🚨 避障记录</div>
+          <div class="avoidance-log" id="avoidance-log">
+            <div class="empty-state">无避障事件</div>
+          </div>
+        </div>
+
         <div class="panel log-panel">
           <div class="panel-title">调度日志</div>
           <div class="log-area" id="log-area"></div>

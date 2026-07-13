@@ -59,3 +59,19 @@ class MessageType(Enum):
     ERROR = "error"
     COMMAND = "command"
     TASK_CONTROL = "task_control"
+    # 2D SLAM 导航新增
+    NLP_TASK = "nlp_task"
+    NAV_TASK = "nav_task"
+    NAV_POSITION_UPDATE = "nav_position_update"
+    AVOIDANCE_EVENT = "avoidance_event"
+    NAV_TASK_COMPLETED = "nav_task_completed"
+    NAV_TASK_SUMMARY = "nav_task_summary"
+
+
+class NavTaskStatus(Enum):
+    """导航任务状态"""
+    PENDING = "pending"
+    NAVIGATING = "navigating"
+    AVOIDING = "avoiding"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"

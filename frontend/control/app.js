@@ -14,6 +14,7 @@ let usingMock = false;
 let reconnectTimer = null;
 let heartbeatTimer = null;
 let seq = 0;
+const OBSTACLE_ALERT_THRESHOLD = 2.0;
 
 // ── 状态 ──
 const robot = {
@@ -86,7 +87,17 @@ function connect() {
     ws.onmessage = (e) => {
       let data;
       try {
-        data = JSON.parse(e.data);
+        if (typeof e.data === 'string') {
+          const text = e.data.trim();
+          if (!(text.startsWith('{') || text.startsWith('['))) {
+            log('DEBUG', 'WS', `忽略非 JSON 消息: ${text.slice(0, 80)}`);
+            return;
+          }
+          data = JSON.parse(text);
+        } else {
+          log('DEBUG', 'WS', `忽略非文本消息: ${Object.prototype.toString.call(e.data)}`);
+          return;
+        }
       } catch (err) {
         const preview = String(e.data).slice(0, 200);
         log('WARN', 'WS', `JSON 解析失败: ${err.message} | 预览: ${preview}`);
@@ -127,6 +138,12 @@ function handleMessage(data) {
   else if (t === 'obstacle') updateObstacle(data);
   else if (t === 'vision_frame') updateVision(data);
   else if (t === 'error') log('ERROR', 'Server', data.message);
+  // 2D 导航消息
+  else if (t === 'nav_position_update') updateNavPosition(data);
+  else if (t === 'avoidance_event') updateAvoidanceEvent(data);
+  else if (t === 'nav_task_completed') updateNavCompleted(data);
+  else if (t === 'nav_task_summary') updateNavSummary(data);
+  else if (t === 'nav_task_cancelled') updateNavCancelled();
 }
 
 function updateStatus(s) {
@@ -153,7 +170,10 @@ function updateStatus(s) {
       robot.yaw = s.orientation.yaw || 0;
     }
   }
-  if (s.obstacle_dist !== undefined) robot.obstacle = s.obstacle_dist;
+  if (s.obstacle_dist !== undefined) {
+    const d = Number(s.obstacle_dist);
+    robot.obstacle = Number.isFinite(d) && d <= OBSTACLE_ALERT_THRESHOLD ? d : null;
+  }
   if (s.joints !== undefined) robot.joints = s.joints;
 
   // UI
@@ -196,9 +216,10 @@ function updateStatus(s) {
 
 function updateObstacle(data) {
   const dist = data.distance !== undefined ? data.distance : null;
-  robot.obstacle = dist;
-  updateObstacleUI(dist);
-  if (dist !== null) log('WARN', 'Obstacle', `检测到障碍物 ${dist.toFixed(2)}m`);
+  const showDist = dist !== null && dist <= OBSTACLE_ALERT_THRESHOLD ? dist : null;
+  robot.obstacle = showDist;
+  updateObstacleUI(showDist);
+  if (showDist !== null) log('WARN', 'Obstacle', `检测到障碍物 ${showDist.toFixed(2)}m`);
 }
 
 function updateObstacleUI(dist) {
@@ -349,6 +370,54 @@ function emergencyStop() {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'emergency_stop', seq: ++seq }));
   log('ERROR', 'ESTOP', '紧急停止已触发');
   document.querySelectorAll('.btn-action').forEach(b => b.classList.remove('active'));
+}
+
+// ── 2D 导航处理 ──
+function updateNavPosition(data) {
+  document.getElementById('ctrl-nav-xy').textContent = `(${data.current_x.toFixed(2)}, ${data.current_y.toFixed(2)})`;
+  document.getElementById('ctrl-nav-yaw').textContent = data.yaw.toFixed(1);
+  document.getElementById('ctrl-nav-dist').textContent = data.distance_to_target.toFixed(2);
+  const pct = (data.progress * 100).toFixed(0);
+  document.getElementById('ctrl-nav-pct').textContent = pct + '%';
+  document.getElementById('ctrl-nav-bar').style.width = pct + '%';
+  if (data.status === 'avoiding') {
+    document.getElementById('ctrl-nav-bar').style.background = '#f59e0b';
+  } else {
+    document.getElementById('ctrl-nav-bar').style.background = '#8b5cf6';
+  }
+}
+
+function updateAvoidanceEvent(data) {
+  log('WARN', 'Avoidance', `避障: 左转${data.turn_angle}°+前进${data.forward_distance}m → 新位置(${data.new_x}, ${data.new_y})`);
+  document.getElementById('ctrl-nav-bar').style.background = '#f59e0b';
+  setTimeout(() => {
+    document.getElementById('ctrl-nav-bar').style.background = '#8b5cf6';
+  }, 2000);
+}
+
+function updateNavCompleted(data) {
+  document.getElementById('ctrl-nav-pct').textContent = '100%';
+  document.getElementById('ctrl-nav-bar').style.width = '100%';
+  document.getElementById('ctrl-nav-bar').style.background = '#22c55e';
+  document.getElementById('ctrl-nav-dist').textContent = '0.00';
+  log('INFO', 'Nav', `✅ 导航完成: ${data.task_name} → ${data.target_location}`);
+}
+
+function updateNavSummary(data) {
+  if (!data.active) return;
+  document.getElementById('ctrl-nav-xy').textContent = `(${data.current.x}, ${data.current.y})`;
+  document.getElementById('ctrl-nav-dist').textContent = data.distance_to_target.toFixed(2);
+  const pct = (data.progress * 100).toFixed(0);
+  document.getElementById('ctrl-nav-pct').textContent = pct + '%';
+  document.getElementById('ctrl-nav-bar').style.width = pct + '%';
+}
+
+function updateNavCancelled() {
+  document.getElementById('ctrl-nav-pct').textContent = '0%';
+  document.getElementById('ctrl-nav-bar').style.width = '0%';
+  document.getElementById('ctrl-nav-xy').textContent = '--';
+  document.getElementById('ctrl-nav-dist').textContent = '--';
+  document.getElementById('ctrl-nav-yaw').textContent = '--';
 }
 
 // ── 时钟 ──

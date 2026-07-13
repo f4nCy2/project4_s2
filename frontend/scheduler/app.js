@@ -1,5 +1,6 @@
 /**
  * Task Scheduler Frontend — 连接 ws://host:8080/ws/scheduler
+ * 支持：自然语言任务（2D SLAM）+ 动作任务
  */
 
 const WS_URL = (() => {
@@ -12,6 +13,8 @@ let ws = null;
 let connected = false;
 let tasks = [];
 let currentTask = null;
+let navActive = false;
+let avoidanceEvents = [];
 
 // ── 日志 ──
 function log(level, source, msg) {
@@ -31,7 +34,14 @@ function connect() {
   try {
     ws = new WebSocket(WS_URL);
     ws.onopen = () => { connected = true; updateConn('online'); log('INFO', 'WS', '调度端连接成功'); };
-    ws.onmessage = (e) => { try { handleMessage(JSON.parse(e.data)); } catch (err) {} };
+    ws.onmessage = (e) => {
+      try {
+        if (typeof e.data !== 'string') { return; }
+        const text = e.data.trim();
+        if (!(text.startsWith('{') || text.startsWith('['))) { return; }
+        handleMessage(JSON.parse(text));
+      } catch (err) { /* ignore */ }
+    };
     ws.onerror = () => { updateConn('offline'); };
     ws.onclose = () => { connected = false; updateConn('offline'); setTimeout(connect, 3000); };
   } catch (e) { updateConn('offline'); setTimeout(connect, 3000); }
@@ -47,12 +57,156 @@ function updateConn(state) {
 // ── 消息处理 ──
 function handleMessage(data) {
   const t = data.type;
+
+  // ── 原有消息类型 ──
   if (t === 'connected') return;
   if (t === 'task_list') { tasks = data.tasks || []; renderTasks(); }
   if (t === 'task_created') { tasks.push(data.task); renderTasks(); log('INFO', 'Scheduler', `任务创建: ${data.task.name}`); }
   if (t === 'task_event') { handleTaskEvent(data); }
+
+  // ── NLP 解析结果 ──
+  if (t === 'nlp_parsed') {
+    handleNLPParsed(data);
+  }
+
+  // ── 导航任务摘要 ──
+  if (t === 'nav_task_summary') {
+    handleNavSummary(data);
+  }
+
+  // ── 导航位置更新 ──
+  if (t === 'nav_position_update') {
+    handleNavPositionUpdate(data);
+  }
+
+  // ── 避障事件 ──
+  if (t === 'avoidance_event') {
+    handleAvoidanceEvent(data);
+  }
+
+  // ── 导航任务完成 ──
+  if (t === 'nav_task_completed') {
+    handleNavCompleted(data);
+  }
+
+  // ── 导航任务取消 ──
+  if (t === 'nav_task_cancelled') {
+    navActive = false;
+    document.getElementById('nav-status-area').innerHTML = '<div class="empty-state">导航任务已取消</div>';
+    log('WARN', 'Nav', '导航任务已取消');
+  }
+
+  // ── 导航轨迹 ──
+  if (t === 'nav_trajectory') {
+    log('INFO', 'Nav', `轨迹点数: ${(data.trajectory||[]).length}, 避障: ${(data.avoidance_log||[]).length}次`);
+  }
 }
 
+// ── NLP 任务处理 ──
+function sendNLPTask() {
+  const text = document.getElementById('nlp-input').value.trim();
+  const currentLocation = document.getElementById('nlp-current-location').value;
+  if (!text) { log('WARN', 'NLP', '请输入任务描述'); return; }
+  send({ type: 'nlp_task', text, current_location: currentLocation });
+  log('INFO', 'NLP', `下发自然语言任务: "${text}" (当前位置: ${currentLocation})`);
+}
+
+function handleNLPParsed(data) {
+  document.getElementById('nlp-result').style.display = 'block';
+  document.getElementById('nlp-task-name').textContent = '✅ ' + data.task_name;
+  document.getElementById('nlp-start').textContent = `${data.start_location} (${data.start.x}, ${data.start.y})`;
+  document.getElementById('nlp-target').textContent = `${data.target_location} (${data.target.x}, ${data.target.y})`;
+  document.getElementById('nlp-yaw').textContent = data.initial_yaw + '°';
+  navActive = true;
+
+  // 更新导航状态区域
+  document.getElementById('nav-status-area').innerHTML = `
+    <div class="nav-active">
+      <div class="nav-header">
+        <span class="nav-name">${data.task_name}</span>
+        <span class="status running">NAVIGATING</span>
+      </div>
+      <div class="nav-route">
+        <span>${data.start_location} (${data.start.x}, ${data.start.y})</span>
+        <span class="nav-arrow">→</span>
+        <span>${data.target_location} (${data.target.x}, ${data.target.y})</span>
+      </div>
+      ${data.target_object ? `<div class="nav-object">🎯 目标物品: ${data.target_object}</div>` : ''}
+    </div>
+  `;
+
+  log('INFO', 'NLP', `解析完成: ${data.task_name} | ${data.start_location}→${data.target_location}`);
+}
+
+// ── 导航位置更新 ──
+function handleNavPositionUpdate(data) {
+  document.getElementById('live-x').textContent = data.current_x.toFixed(2);
+  document.getElementById('live-y').textContent = data.current_y.toFixed(2);
+  document.getElementById('live-yaw').textContent = data.yaw.toFixed(1);
+  document.getElementById('live-dist').textContent = data.distance_to_target.toFixed(2);
+  const pct = (data.progress * 100).toFixed(0);
+  document.getElementById('live-progress').textContent = pct;
+  document.getElementById('nav-progress-bar').style.width = pct + '%';
+
+  // 更新导航状态
+  if (navActive) {
+    const statusArea = document.getElementById('nav-status-area');
+    const statusBadge = statusArea.querySelector('.status');
+    if (statusBadge) {
+      statusBadge.textContent = data.status === 'avoiding' ? 'AVOIDING' : 'NAVIGATING';
+      statusBadge.className = 'status ' + (data.status === 'avoiding' ? 'avoiding' : 'running');
+    }
+  }
+}
+
+// ── 避障事件 ──
+function handleAvoidanceEvent(data) {
+  avoidanceEvents.push(data);
+  const log = document.getElementById('avoidance-log');
+  if (avoidanceEvents.length === 1) log.innerHTML = '';
+
+  const div = document.createElement('div');
+  div.className = 'avoidance-item';
+  div.innerHTML = `
+    <div class="avoid-header">⚠️ 避障 #${data.index || avoidanceEvents.length}</div>
+    <div class="avoid-detail">
+      <div>触发位置: (${data.trigger_x}, ${data.trigger_y})</div>
+      <div>动作: 左转 ${data.turn_angle}° + 前进 ${data.forward_distance}m</div>
+      <div>新位置: (${data.new_x}, ${data.new_y})</div>
+      <div>剩余距离: ${data.remaining_distance}m</div>
+    </div>
+  `;
+  log.insertBefore(div, log.firstChild);
+  log('WARN', 'Avoidance', `避障 #${data.index || avoidanceEvents.length}: 左转${data.turn_angle}°+前进${data.forward_distance}m → 剩余${data.remaining_distance}m`);
+}
+
+// ── 导航完成 ──
+function handleNavCompleted(data) {
+  navActive = false;
+  document.getElementById('nav-status-area').innerHTML = `
+    <div class="nav-completed">
+      <div class="nav-header">
+        <span class="nav-name">✅ ${data.task_name}</span>
+        <span class="status completed">COMPLETED</span>
+      </div>
+      <div class="nav-detail">
+        <div>到达: ${data.target_location}</div>
+        <div>总步数: ${data.total_steps}</div>
+        <div>避障次数: ${data.avoidance_count}</div>
+        <div>耗时: ${data.elapsed_seconds.toFixed(1)}s</div>
+      </div>
+    </div>
+  `;
+  document.getElementById('live-progress').textContent = '100';
+  document.getElementById('nav-progress-bar').style.width = '100%';
+  log('INFO', 'Nav', `✅ 任务完成: ${data.task_name} | 步数=${data.total_steps} 避障=${data.avoidance_count}次`);
+}
+
+// ── 导航操作 ──
+function refreshNavSummary() { send({ type: 'get_nav_summary' }); }
+function cancelNavTask() { send({ type: 'cancel_nav_task' }); navActive = false; }
+
+// ── 任务事件 ──
 function handleTaskEvent(data) {
   const evt = data.event;
   const tid = data.task_id;
@@ -68,6 +222,34 @@ function handleTaskEvent(data) {
   renderTasks();
   renderCurrentTask();
   log('INFO', 'Task', `${task.name}: ${evt}`);
+}
+
+function handleNavSummary(data) {
+  if (!data.active) {
+    navActive = false;
+    document.getElementById('nav-status-area').innerHTML = '<div class="empty-state">暂无活跃导航任务</div>';
+    return;
+  }
+  navActive = true;
+  document.getElementById('nav-status-area').innerHTML = `
+    <div class="nav-active">
+      <div class="nav-header">
+        <span class="nav-name">${data.task_name}</span>
+        <span class="status ${data.status === 'navigating' ? 'running' : data.status}">${data.status.toUpperCase()}</span>
+      </div>
+      <div class="nav-route">
+        <span>${data.start_location} (${data.start.x}, ${data.start.y})</span>
+        <span class="nav-arrow">→</span>
+        <span>${data.target_location} (${data.target.x}, ${data.target.y})</span>
+      </div>
+      <div class="nav-detail">
+        <div>当前位置: (${data.current.x}, ${data.current.y})</div>
+        <div>距终点: ${data.distance_to_target}m / 总距: ${data.total_distance}m</div>
+        <div>进度: ${(data.progress*100).toFixed(0)}% | 步数: ${data.step_count}</div>
+        <div>避障: ${data.avoidance_count}次 | 耗时: ${data.elapsed_seconds.toFixed(1)}s</div>
+      </div>
+    </div>
+  `;
 }
 
 // ── 渲染任务列表 ──

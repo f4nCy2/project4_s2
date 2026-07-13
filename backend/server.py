@@ -9,11 +9,18 @@
   /ws/scheduler — 任务调度界面（前端 B2）
   /ws/robot   — 机器人底层连接：接收 d435i 控制指令 + 状态回传
 
+2D SLAM 导航新增功能：
+  - NLP 任务解析：/scheduler 下发自然语言任务 → 解析为 2D 坐标
+  - 坐标流推送：机器人模拟端每秒回传坐标 → 后端 → WS 推送前端
+  - 避障联动：避障事件 → 坐标更新 → 前后端同步
+
 功能：
   - 接收 d435i 实时控制指令 → 直接通过 TCP 转发给机器人
   - 接收任务创建 → 交给 TaskManager → 调度执行（高层动作）
   - 接收状态回传 → 广播给所有前端
   - 视觉帧 → 广播给控制端
+  - 自然语言任务解析 → 2D SLAM 坐标生成 → TCP 下发
+  - 2D 导航坐标流 → WS 实时推送前端
 """
 import asyncio
 import json
@@ -35,12 +42,16 @@ from backend.config import WS_HOST, WS_PORT, TCP_HOST, TCP_PORT
 from backend.common.models import (
     Command, TaskControlCommand, StatusMessage, TaskEventMessage,
     ObstacleMessage, VisionFrameMessage, AckMessage, ErrorMessage,
-    RobotStatus, Action, ActionParams, TaskStatus
+    RobotStatus, Action, ActionParams, TaskStatus,
+    NavTaskPacket, NavPositionUpdate, AvoidanceEvent, NavTaskCompleted,
+    NavTaskSummary, NLPTaskRequest
 )
 from backend.common.enums import ActionType, RobotState, TaskPriority
 from backend.task_planner.task_manager import TaskManager
 from backend.task_planner.action_scheduler import ActionScheduler
 from backend.task_planner.motion_planner import MotionPlanner
+from backend.task_planner.nlp_parser import get_nlp_parser
+from backend.task_planner.slam_coordinator import get_slam_coordinator
 from backend.communication.api_service import APIService
 
 @asynccontextmanager
@@ -70,6 +81,8 @@ class ServerState:
         self.robot_status = RobotStatus()
         self._seq = 0
         self._avoidance_mode = False  # 是否由 d435i 接管避障控制
+        self.slam = get_slam_coordinator()  # 2D SLAM 坐标协调器
+        self.nlp = get_nlp_parser()         # NLP 任务解析器
 
 state = ServerState()
 
@@ -91,6 +104,21 @@ def _is_valid_frame(frame: str) -> bool:
     except Exception:
         return False
     return True
+
+
+def _extract_obstacle_distance(msg: dict):
+    """从 d435i 消息中提取前方障碍物距离（米）。"""
+    for key in ("obstacle_dist", "front_distance", "distance", "min_distance"):
+        val = msg.get(key)
+        if val is None:
+            continue
+        try:
+            dist = float(val)
+        except (TypeError, ValueError):
+            continue
+        if dist >= 0:
+            return dist
+    return None
 
 # ── 初始化模块 ──
 async def init_modules_async():
@@ -132,7 +160,7 @@ async def _connect_apiservice(apiservice: APIService):
 
 
 async def _handle_robot_status(msg):
-    """处理机器人底层状态上报"""
+    """处理机器人底层状态上报（含 2D 导航数据）"""
     raw = msg.get("status", {})
 
     # 兼容数组格式的 position/orientation（robot_simulator.py 发送 [x,y] / [r,p,y]）
@@ -148,6 +176,16 @@ async def _handle_robot_status(msg):
     status = RobotStatus(**raw)
     state.robot_status = status
     await _broadcast_control({"type": "status", "status": status.model_dump()})
+
+    # ── 2D 导航：检查是否包含 nav_position 数据 ──
+    nav_pos = msg.get("nav_position")
+    if nav_pos:
+        await _handle_nav_position_update(nav_pos)
+
+    # ── 2D 导航：检查避障事件 ──
+    avoid_evt = msg.get("avoidance_event")
+    if avoid_evt:
+        await _handle_avoidance_event(avoid_evt)
 
 
 async def _handle_robot_task_event(msg):
@@ -196,6 +234,83 @@ async def _broadcast_scheduler(payload: dict):
         state.scheduler_clients.discard(ws)
 
 
+# ── 2D SLAM 导航数据处理 ──
+
+async def _handle_nav_position_update(nav_pos: dict):
+    """处理机器人模拟端回传的 2D 坐标更新"""
+    x = nav_pos.get("current_x", 0.0)
+    y = nav_pos.get("current_y", 0.0)
+    yaw = nav_pos.get("yaw", 0.0)
+    dist = nav_pos.get("distance_to_target", 0.0)
+    status = nav_pos.get("status", "navigating")
+
+    # 更新 SLAM 协调器
+    update = state.slam.update_position(x, y, yaw, dist, status)
+
+    # 推送至所有前端
+    await _broadcast_nav_update(update)
+
+    # 检查是否到达
+    if dist < 0.05 and status == "navigating":
+        completed = state.slam.complete_task()
+        if completed:
+            await _broadcast_nav_update(completed)
+
+
+async def _handle_avoidance_event(avoid_data: dict):
+    """处理避障事件"""
+    log_entry = state.slam.record_avoidance(
+        trigger_x=avoid_data.get("trigger_x", 0.0),
+        trigger_y=avoid_data.get("trigger_y", 0.0),
+        turn_angle=avoid_data.get("turn_angle", 45.0),
+        forward_distance=avoid_data.get("forward_distance", 2.0),
+        new_x=avoid_data.get("new_x", 0.0),
+        new_y=avoid_data.get("new_y", 0.0),
+        new_yaw=avoid_data.get("new_yaw", 0.0),
+        remaining_distance=avoid_data.get("remaining_distance", 0.0),
+    )
+
+    # 推送避障事件至控制端和调度端
+    await _broadcast_control(log_entry)
+    await _broadcast_scheduler(log_entry)
+
+
+async def _broadcast_nav_update(payload: dict):
+    """广播 2D 导航更新给控制端和调度端"""
+    data = json.dumps(payload, ensure_ascii=False, default=str)
+    # 控制端
+    dead = []
+    for ws in state.control_clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.control_clients.discard(ws)
+    # 调度端
+    dead = []
+    for ws in state.scheduler_clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.scheduler_clients.discard(ws)
+
+
+async def _send_nav_task_to_robot(nav_packet: dict):
+    """通过 TCP 下发导航任务到机器人模拟端"""
+    if not state.apiservice:
+        print("[Server] ⚠️ 无法下发导航任务：TCP 未连接")
+        return False
+    data = json.dumps(nav_packet, ensure_ascii=False).encode("utf-8")
+    ok = state.apiservice.send_raw(data)
+    if ok:
+        print(f"[Server] 📍 导航任务已下发: {nav_packet.get('task_name')} "
+              f"({nav_packet.get('start_location')} → {nav_packet.get('target_location')})")
+    return ok
+
+
 # ── WebSocket 端点 ──
 
 @app.websocket("/ws/control")
@@ -208,10 +323,11 @@ async def ws_control(websocket: WebSocket):
 
     try:
         while True:
-            msg = await websocket.receive_json()
+            try:
+                msg = await websocket.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
             await _handle_control_message(msg)
-    except WebSocketDisconnect:
-        pass
     finally:
         state.control_clients.discard(websocket)
         print(f"[WS] 控制端断开，当前 {len(state.control_clients)} 个")
@@ -228,15 +344,16 @@ async def ws_scheduler(websocket: WebSocket):
     tasks = state.task_manager.get_all_tasks() if state.task_manager else []
     await websocket.send_json({
         "type": "task_list",
-        "tasks": [t.model_dump() for t in tasks]
+        "tasks": [t.model_dump(mode="json") for t in tasks]
     })
 
     try:
         while True:
-            msg = await websocket.receive_json()
+            try:
+                msg = await websocket.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
             await _handle_scheduler_message(msg)
-    except WebSocketDisconnect:
-        pass
     finally:
         state.scheduler_clients.discard(websocket)
 
@@ -268,16 +385,27 @@ async def ws_robot(websocket: WebSocket):
                     steer = msg.get("steer")
                     speed = msg.get("speed")
                     source = msg.get("source", "unknown")
+                    obstacle_dist = _extract_obstacle_distance(msg)
 
                     # 直接转发给 TCP 机器人底层
                     if state.apiservice:
                         await _forward_d435i_control(steer, speed, source)
+
+                    # 若算法上报了前方距离，广播给控制端用于“前方距离”UI显示
+                    if obstacle_dist is not None:
+                        state.robot_status.obstacle_dist = obstacle_dist
+                        await _broadcast_control({
+                            "type": "obstacle",
+                            "distance": obstacle_dist,
+                            "timestamp": msg.get("timestamp", time.time())
+                        })
 
                     # 同时广播给控制端，让前端显示 d435i 的实时决策
                     await _broadcast_control({
                         "type": "d435i_control",
                         "steer": steer,
                         "speed": speed,
+                        "obstacle_dist": obstacle_dist,
                         "source": source,
                         "timestamp": msg.get("timestamp", time.time())
                     })
@@ -321,7 +449,10 @@ async def ws_robot(websocket: WebSocket):
                 })
 
             except Exception as e:
-                await websocket.send_json({"type": "error", "message": str(e)})
+                try:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                except Exception:
+                    break
 
     except WebSocketDisconnect as e:
         print(f"[WS] 机器人端断开: code={e.code}, reason={e.reason}")
@@ -384,14 +515,90 @@ async def _handle_control_message(msg: dict):
             state.task_manager.emergency_stop()
         if state.apiservice:
             state.apiservice.emergency_stop()
+        # 同时取消 2D 导航
+        state.slam.reset()
 
     elif mtype == "heartbeat":
         await _broadcast_control({"type": "heartbeat", "seq": msg.get("seq", 0)})
+
+    # ── 2D 导航：控制端请求导航摘要 ──
+    elif mtype == "get_nav_summary":
+        summary = state.slam.get_task_summary()
+        await _broadcast_control({"type": "nav_task_summary", **summary})
+
+    # ── 2D 导航：控制端请求轨迹 ──
+    elif mtype == "get_nav_trajectory":
+        trajectory = state.slam.get_trajectory()
+        await _broadcast_control({
+            "type": "nav_trajectory",
+            "trajectory": trajectory,
+            "avoidance_log": state.slam.get_avoidance_log(),
+        })
 
 
 async def _handle_scheduler_message(msg: dict):
     """处理调度端消息"""
     mtype = msg.get("type", "")
+
+    # ── 自然语言任务（2D SLAM 导航新增）──
+    if mtype == "nlp_task":
+        text = msg.get("text", "")
+        current_location = msg.get("current_location", "客厅")
+
+        # 使用 NLP 解析器解析任务
+        nav_packet = state.nlp.parse_to_navigation_packet(text, current_location)
+
+        # 在 SLAM 协调器中注册任务
+        state.slam.start_nav_task(nav_packet)
+
+        # 告知调度端解析结果
+        await _broadcast_scheduler({
+            "type": "nlp_parsed",
+            "task_name": nav_packet["task_name"],
+            "raw_text": text,
+            "start_location": nav_packet["start_location"],
+            "target_location": nav_packet["target_location"],
+            "start": {"x": nav_packet["start_x"], "y": nav_packet["start_y"]},
+            "target": {"x": nav_packet["target_x"], "y": nav_packet["target_y"]},
+            "initial_yaw": nav_packet["initial_yaw"],
+            "target_object": nav_packet.get("target_object"),
+        })
+
+        # 下发导航任务到机器人模拟端
+        await _send_nav_task_to_robot(nav_packet)
+
+        # 推送任务摘要
+        summary = state.slam.get_task_summary()
+        await _broadcast_scheduler({"type": "nav_task_summary", **summary})
+        await _broadcast_control({"type": "nav_task_summary", **summary})
+        return
+
+    # ── 获取导航任务摘要 ──
+    if mtype == "get_nav_summary":
+        summary = state.slam.get_task_summary()
+        await _broadcast_scheduler({"type": "nav_task_summary", **summary})
+        return
+
+    # ── 获取导航轨迹 ──
+    if mtype == "get_nav_trajectory":
+        trajectory = state.slam.get_trajectory()
+        avoidance_log = state.slam.get_avoidance_log()
+        await _broadcast_scheduler({
+            "type": "nav_trajectory",
+            "trajectory": trajectory,
+            "avoidance_log": avoidance_log,
+        })
+        return
+
+    # ── 取消导航任务 ──
+    if mtype == "cancel_nav_task":
+        state.slam.reset()
+        # 发送紧急停止到机器人
+        if state.apiservice:
+            state.apiservice.emergency_stop()
+        await _broadcast_scheduler({"type": "nav_task_cancelled"})
+        await _broadcast_control({"type": "nav_task_cancelled"})
+        return
 
     if mtype == "create_task":
         # 创建任务
@@ -415,7 +622,7 @@ async def _handle_scheduler_message(msg: dict):
         task = state.task_manager.create_task(name=name, actions=actions, priority=priority)
         await _broadcast_scheduler({
             "type": "task_created",
-            "task": task.model_dump()
+            "task": task.model_dump(mode="json")
         })
 
     elif mtype == "start_task":
@@ -437,7 +644,7 @@ async def _handle_scheduler_message(msg: dict):
         tasks = state.task_manager.get_all_tasks()
         await _broadcast_scheduler({
             "type": "task_list",
-            "tasks": [t.model_dump() for t in tasks]
+            "tasks": [t.model_dump(mode="json") for t in tasks]
         })
 
 
@@ -468,7 +675,30 @@ async def api_tasks():
     if not state.task_manager:
         return {"success": False, "tasks": []}
     tasks = state.task_manager.get_all_tasks()
-    return {"success": True, "tasks": [t.model_dump() for t in tasks]}
+    return {"success": True, "tasks": [t.model_dump(mode="json") for t in tasks]}
+
+
+@app.get("/api/nav/status")
+async def api_nav_status():
+    """获取 2D 导航任务状态"""
+    return {"success": True, **state.slam.get_task_summary()}
+
+
+@app.get("/api/nav/trajectory")
+async def api_nav_trajectory():
+    """获取 2D 导航轨迹"""
+    return {
+        "success": True,
+        "trajectory": state.slam.get_trajectory(),
+        "avoidance_log": state.slam.get_avoidance_log(),
+    }
+
+
+@app.get("/api/locations")
+async def api_locations():
+    """获取室内场景点位坐标库"""
+    from backend.task_planner.nlp_parser import LOCATION_DB
+    return {"success": True, "locations": LOCATION_DB}
 
 
 # ── 入口 ──

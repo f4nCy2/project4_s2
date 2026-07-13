@@ -432,6 +432,33 @@ const StatusManager = (() => {
     });
   }
 
+  /** 2D 导航位置更新 */
+  function updateNavPosition(data) {
+    // 更新位置显示 — 使用控制面板的坐标区域
+    const el = document.getElementById('m-distance');
+    if (el && data.distance_to_target !== undefined) {
+      el.textContent = data.distance_to_target.toFixed(1);
+    }
+    // 更新姿态中的 yaw
+    if (data.yaw !== undefined) {
+      _robotStatus.orientation[2] = data.yaw;
+      _updateMotionUI();
+    }
+    // 更新位置
+    if (data.current_x !== undefined && data.current_y !== undefined) {
+      _robotStatus.position[0] = data.current_x;
+      _robotStatus.position[1] = data.current_y;
+      _updateMotionUI();
+    }
+    // 状态
+    if (data.status === 'avoiding') {
+      _robotStatus.state = 'avoiding';
+    } else if (data.status === 'navigating') {
+      _robotStatus.state = 'moving';
+    }
+    _updateStateUI();
+  }
+
   return {
     // IStatusManager 接口
     updateRobotStatus,
@@ -447,6 +474,8 @@ const StatusManager = (() => {
     setObstacleDist,
     getVelocity, setVelocity,
     getHistory,
-    simulateUpdate
+    simulateUpdate,
+    // 2D 导航
+    updateNavPosition
   };
 })();

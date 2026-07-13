@@ -1,7 +1,7 @@
 """数据模型（Pydantic v2）"""
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from .enums import ActionType, RobotState, TaskStatus, TaskPriority
+from .enums import ActionType, RobotState, TaskStatus, TaskPriority, NavTaskStatus
 
 
 class Position(BaseModel):
@@ -153,3 +153,108 @@ class TaskPlannedMessage(BaseModel):
     task_name: str
     actions: List[Action]
     total_steps: int
+
+
+# ═══════════════════════════════════════════════════════════
+# 2D SLAM 导航相关模型（新增 - 不修改原有模型）
+# ═══════════════════════════════════════════════════════════
+
+class Point2D(BaseModel):
+    """2D 平面坐标"""
+    x: float = 0.0
+    y: float = 0.0
+
+
+class LocationInfo(BaseModel):
+    """室内场景点位信息"""
+    name: str
+    x: float
+    y: float
+    description: str = ""
+
+
+class NLPTaskRequest(BaseModel):
+    """自然语言任务请求"""
+    type: str = "nlp_task"
+    text: str = ""                          # 自然语言描述
+    current_location: str = "客厅"           # 机器人当前位置
+
+
+class NavTaskPacket(BaseModel):
+    """导航任务数据包（下发至机器人模拟端）"""
+    type: str = "nav_task"
+    task_name: str = ""
+    raw_text: str = ""
+    start_location: str = ""
+    target_location: str = ""
+    start_x: float = 0.0
+    start_y: float = 0.0
+    target_x: float = 0.0
+    target_y: float = 0.0
+    initial_yaw: float = 0.0
+    target_object: Optional[str] = None
+    action: str = "navigate"
+
+
+class NavPositionUpdate(BaseModel):
+    """机器人位置更新（每秒回传）"""
+    type: str = "nav_position_update"
+    task_id: str = ""
+    task_name: str = ""
+    current_x: float = 0.0
+    current_y: float = 0.0
+    yaw: float = 0.0
+    distance_to_target: float = 0.0
+    progress: float = 0.0
+    status: str = "navigating"
+    step: int = 0
+    timestamp: float = 0.0
+
+
+class AvoidanceEvent(BaseModel):
+    """避障事件"""
+    type: str = "avoidance_event"
+    task_id: str = ""
+    index: int = 0
+    trigger_x: float = 0.0
+    trigger_y: float = 0.0
+    turn_angle: float = 45.0
+    forward_distance: float = 2.0
+    new_x: float = 0.0
+    new_y: float = 0.0
+    new_yaw: float = 0.0
+    remaining_distance: float = 0.0
+    timestamp: float = 0.0
+
+
+class NavTaskCompleted(BaseModel):
+    """导航任务完成"""
+    type: str = "nav_task_completed"
+    task_id: str = ""
+    task_name: str = ""
+    target_location: str = ""
+    total_steps: int = 0
+    avoidance_count: int = 0
+    elapsed_seconds: float = 0.0
+    trajectory: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class NavTaskSummary(BaseModel):
+    """导航任务摘要"""
+    active: bool = False
+    task_id: str = ""
+    task_name: str = ""
+    raw_text: str = ""
+    start_location: str = ""
+    target_location: str = ""
+    start: Point2D = Field(default_factory=Point2D)
+    target: Point2D = Field(default_factory=Point2D)
+    current: Point2D = Field(default_factory=Point2D)
+    yaw: float = 0.0
+    distance_to_target: float = 0.0
+    total_distance: float = 0.0
+    progress: float = 0.0
+    status: str = "idle"
+    avoidance_count: int = 0
+    elapsed_seconds: float = 0.0
+    step_count: int = 0
