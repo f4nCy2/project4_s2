@@ -9,6 +9,12 @@ __pycache__/
 *.py[cod]
 *.so
 
+# Claude Code
+.claude/
+
+# Logs
+.logs/
+
 # Excluded folders
 ppt/
 ppt-report/

@@ -47,6 +47,7 @@ class ProcessWrapper:
 
     def start(self):
         env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         # 让子进程知道自己是被 launcher 启动的，避免重复嵌套
         env["ROBOT_SIDE_LAUNCHED"] = "1"
         self.proc = subprocess.Popen(
@@ -56,6 +57,8 @@ class ProcessWrapper:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             # Windows 需要这个才能正确发信号终止子进程
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,

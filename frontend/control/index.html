@@ -22,6 +22,7 @@
         </span>
       </div>
       <div class="topbar-right">
+        <a href="/scheduler" class="nav-link">任务调度 →</a>
         <span class="time" id="clock">--:--:--</span>
       </div>
     </header>
@@ -92,6 +93,17 @@
             <span class="dist-label">前方距离</span>
             <div class="dist-track"><div class="dist-fill" id="dist-fill" style="width:100%"></div></div>
             <span class="dist-val" id="dist-val">安全</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">📍 2D 导航位置</div>
+          <div class="nav-mini" id="nav-mini">
+            <div class="nav-mini-row"><span>坐标:</span> <b id="ctrl-nav-xy">--</b></div>
+            <div class="nav-mini-row"><span>航向:</span> <b id="ctrl-nav-yaw">--</b>°</div>
+            <div class="nav-mini-row"><span>距终点:</span> <b id="ctrl-nav-dist">--</b>m</div>
+            <div class="progress-track" style="margin-top:6px"><div class="progress-bar" id="ctrl-nav-bar" style="width:0%"></div></div>
+            <div class="nav-mini-row" style="margin-top:4px"><span>进度:</span> <b id="ctrl-nav-pct">0%</b></div>
           </div>
         </div>
       </aside>

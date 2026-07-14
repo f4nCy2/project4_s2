@@ -10,6 +10,9 @@ html, body { height:100%; font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaH
 .logo-icon { color:#3b82f6; font-size:18px; }
 .logo-text { font-size:15px; font-weight:600; letter-spacing:1px; color:#fff; }
 .topbar-center { display:flex; align-items:center; gap:16px; }
+.topbar-right { display:flex; align-items:center; gap:16px; }
+.nav-link { color:#60a5fa; text-decoration:none; font-size:13px; }
+.nav-link:hover { text-decoration:underline; }
 .badge { padding:3px 12px; border-radius:4px; font-size:12px; font-weight:600; background:#1e293b; color:#94a3b8; border:1px solid #334155; }
 .badge.moving { background:#064e3b; color:#34d399; border-color:#059669; }
 .badge.avoiding { background:#7f1d1d; color:#f87171; border-color:#dc2626; }
@@ -23,11 +26,20 @@ html, body { height:100%; font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaH
 .time { font-size:13px; font-family:monospace; color:#64748b; }
 
 /* ===== MAIN LAYOUT ===== */
-.main { display:flex; flex:1; overflow:hidden; padding:12px; gap:12px; }
+.main { display:flex; flex:1; overflow:hidden; padding:12px; gap:12px; min-height:0; }
 
-.sidebar { display:flex; flex-direction:column; gap:12px; width:260px; flex-shrink:0; overflow-y:auto; }
+.sidebar { display:flex; flex-direction:column; gap:12px; width:260px; flex-shrink:0; overflow-y:auto; min-height:0; }
 .sidebar.center { flex:1; width:auto; }
 .sidebar.right { width:280px; }
+
+.center {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
 
 /* ===== PANEL ===== */
 .panel { background:#111420; border:1px solid #1e2330; border-radius:8px; padding:14px; }
@@ -117,6 +129,11 @@ html, body { height:100%; font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaH
 .log-DEBUG .log-level { color:#a78bfa; }
 .log-source { color:#475569; }
 
+/* ===== 2D 导航面板 ===== */
+.nav-mini { padding:4px 0; }
+.nav-mini-row { font-size:12px; color:#94a3b8; margin-bottom:4px; display:flex; justify-content:space-between; }
+.nav-mini-row b { color:#60a5fa; font-family:monospace; }
+
 /* ===== SCROLLBAR ===== */
 ::-webkit-scrollbar { width:6px; }
 ::-webkit-scrollbar-track { background:transparent; }
@@ -127,4 +144,10 @@ html, body { height:100%; font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaH
 @media (max-width: 1200px) {
   .sidebar { width:220px; }
   .sidebar.right { width:240px; }
+}
+
+@media (max-height: 880px) {
+  .video-panel {
+    aspect-ratio: 16 / 7.8;
+  }
 }

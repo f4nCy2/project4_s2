@@ -11,6 +11,7 @@ import cv2
 import math
 import time
 import json
+import base64
 import threading
 from typing import Optional
 
@@ -93,6 +94,24 @@ class BackendClient:
 
         asyncio.run(run())
 
+    def _enqueue_latest(self, msg: str, tag: str):
+        """在线程安全地入队；队列满时丢弃最旧消息，优先保留最新帧/指令。"""
+        if not self._loop or not self._send_queue:
+            return
+
+        def _put_now():
+            try:
+                self._send_queue.put_nowait(msg)
+            except Exception:
+                # 队列满时移除最旧一条，再塞入最新一条，避免持续积压导致画面卡住
+                try:
+                    _ = self._send_queue.get_nowait()
+                    self._send_queue.put_nowait(msg)
+                except Exception as e:
+                    print(f"[BackendClient] {tag} 入队失败: {e}")
+
+        self._loop.call_soon_threadsafe(_put_now)
+
     def send_frame(self, frame_b64: str):
         """发送视觉帧给后端（线程安全，限流 5fps）"""
         if not self.enabled or not self._connected or not self._ws or not self._loop:
@@ -106,12 +125,9 @@ class BackendClient:
             "frame": frame_b64,
             "timestamp": now
         })
-        try:
-            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, msg)
-        except Exception as e:
-            print(f"[BackendClient] 帧入队失败: {e}")
+        self._enqueue_latest(msg, "视频帧")
 
-    def send_control(self, steer: float, speed: float):
+    def send_control(self, steer: float, speed: float, obstacle_dist: Optional[float] = None):
         """发送实时控制指令（线程安全）"""
         if not self.enabled or not self._connected or not self._ws or not self._loop:
             return
@@ -124,12 +140,11 @@ class BackendClient:
             "source": "d435i_vfh",
             "steer": round(steer, 2) if steer is not None else None,
             "speed": round(speed, 3),
+            "obstacle_dist": round(obstacle_dist, 2) if obstacle_dist is not None else None,
+            "front_distance": round(obstacle_dist, 2) if obstacle_dist is not None else None,
             "timestamp": now
         })
-        try:
-            self._loop.call_soon_threadsafe(self._send_queue.put_nowait, msg)
-        except Exception as e:
-            print(f"[BackendClient] 控制指令入队失败: {e}")
+        self._enqueue_latest(msg, "控制指令")
 
 
 # ========================== 用户可调参数 ==========================
@@ -164,6 +179,68 @@ class Config:
 
     # --- 可视化 ---
     GRID_VIS_SIZE = 480          # 栅格图等比显示尺寸
+
+    # --- 前方距离估计（用于前端显示）---
+    FRONT_ROI_X_RATIO = 0.22     # 前方区域宽度占图像宽度比例
+    FRONT_ROI_Y_TOP_RATIO = 0.38 # 前方区域上边界（占高度比例）
+    FRONT_ROI_Y_BOT_RATIO = 0.86 # 前方区域下边界（占高度比例）
+    FRONT_MIN_VALID = 0.15       # 有效最小距离(m)
+    FRONT_MAX_VALID = 3.5        # 有效最大距离(m)
+    FRONT_PERCENTILE = 30        # 抗噪分位数（比最小值稳）
+    FRONT_MEDIAN_WINDOW = 5      # 中值窗口长度
+    FRONT_EMA_ALPHA = 0.35       # EMA平滑系数
+    FRONT_MAX_JUMP = 0.60        # 单帧最大变化限幅(m)
+
+
+class FrontDistanceEstimator:
+    """前方距离稳态估计：ROI分位数 + 中值窗口 + EMA + 限幅。"""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._window = []
+        self._ema = None
+        self._last = None
+
+    def update(self, depth_frame) -> Optional[float]:
+        if depth_frame is None:
+            return self._last
+
+        depth = np.asanyarray(depth_frame.get_data())
+        if depth is None or depth.size == 0:
+            return self._last
+
+        h, w = depth.shape[:2]
+        roi_w = int(w * self.cfg.FRONT_ROI_X_RATIO)
+        x1 = max(0, (w - roi_w) // 2)
+        x2 = min(w, x1 + roi_w)
+        y1 = int(h * self.cfg.FRONT_ROI_Y_TOP_RATIO)
+        y2 = int(h * self.cfg.FRONT_ROI_Y_BOT_RATIO)
+        if x2 <= x1 or y2 <= y1:
+            return self._last
+
+        roi_m = depth[y1:y2, x1:x2].astype(np.float32) / 1000.0
+        valid = roi_m[(roi_m >= self.cfg.FRONT_MIN_VALID) & (roi_m <= self.cfg.FRONT_MAX_VALID)]
+        if valid.size < 30:
+            return self._last
+
+        raw = float(np.percentile(valid, self.cfg.FRONT_PERCENTILE))
+
+        self._window.append(raw)
+        if len(self._window) > self.cfg.FRONT_MEDIAN_WINDOW:
+            self._window.pop(0)
+        med = float(np.median(self._window))
+
+        if self._ema is None:
+            filtered = med
+        else:
+            filtered = self._ema + self.cfg.FRONT_EMA_ALPHA * (med - self._ema)
+            delta = filtered - self._ema
+            if abs(delta) > self.cfg.FRONT_MAX_JUMP:
+                filtered = self._ema + (self.cfg.FRONT_MAX_JUMP if delta > 0 else -self.cfg.FRONT_MAX_JUMP)
+
+        self._ema = filtered
+        self._last = round(float(filtered), 2)
+        return self._last
 
 
 # ========================== RealSense 封装 ==========================
@@ -417,6 +494,7 @@ def visualize(depth_frame, grid, steer, speed, cfg: Config):
 def main():
     cfg = Config()
     cam = RealSenseCamera(cfg)
+    front_estimator = FrontDistanceEstimator(cfg)
 
     print("=" * 50)
     print("D435i 避障验证程序 (修正版)")
@@ -448,6 +526,9 @@ def main():
             valid = (xyz[:, 2] > cfg.MIN_DEPTH) & (xyz[:, 2] < cfg.MAX_DEPTH)
             xyz = xyz[valid]
 
+            # 1.1 估计前方距离（用于前端展示，非避障主决策）
+            front_dist = front_estimator.update(depth)
+
             # 2. 坐标转换 + 地面分割
             xyz_level = compensate_tilt(xyz, cfg.CAM_TILT)
             obs = filter_ground(xyz_level, cfg.CAM_HEIGHT, clearance=0.12)
@@ -459,7 +540,7 @@ def main():
             steer, speed = vfh_decision(grid, cfg)
 
             # 4.1 发送控制指令给后端
-            backend.send_control(steer, speed)
+            backend.send_control(steer, speed, front_dist)
 
             # 5. 可视化
             visualize(depth, grid, steer, speed, cfg)
@@ -467,7 +548,7 @@ def main():
             frame_count += 1
             if frame_count % 30 == 0:
                 fps = frame_count / (time.time() - t0)
-                print(f"[FPS {fps:.1f}] Obs: {len(obs):4d} | Decision: steer={steer}, v={speed}")
+                print(f"[FPS {fps:.1f}] Obs: {len(obs):4d} | Decision: steer={steer}, v={speed}, front={front_dist}")
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):

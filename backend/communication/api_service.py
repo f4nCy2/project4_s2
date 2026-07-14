@@ -85,6 +85,19 @@ class APIService:
                 self._on_action_event(msg)
             elif mtype == "heartbeat":
                 self._heartbeat.on_pong()
+            # ── 2D 导航消息路由 ──
+            elif mtype == "nav_position_update":
+                # 将导航位置更新包装为 status 消息转发到后端
+                if self._on_status:
+                    self._on_status({"type": "status", "status": {}, "nav_position": msg})
+            elif mtype == "avoidance_event":
+                # 避障事件转发
+                if self._on_status:
+                    self._on_status({"type": "status", "status": {}, "avoidance_event": msg})
+            elif mtype == "nav_task_completed":
+                # 导航任务完成 — 通过 on_status 路由
+                if self._on_status:
+                    self._on_status({"type": "status", "status": {}, "nav_completed": msg})
         except Exception as e:
             print(f"[APIService] 消息解析失败: {e}")
 
