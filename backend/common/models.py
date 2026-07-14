@@ -83,6 +83,7 @@ class Command(BaseModel):
     seq: int = 0
     priority: str = "NORMAL"
     task_id: Optional[str] = None
+    action_id: Optional[int] = None  # 闭环确认：动作ID
 
 
 class TaskControlCommand(BaseModel):

@@ -82,6 +82,8 @@ function connect() {
       updateConn('online');
       log('INFO', 'WS', `连接成功: ${WS_URL}`);
       heartbeatTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'heartbeat', seq:++seq, ts:Date.now()})); }, 5000);
+      // 拉取任务列表（与调度面板同步）
+      ws.send(JSON.stringify({type: 'get_tasks'}));
     };
     ws.onmessage = (e) => {
       let data;
@@ -124,6 +126,10 @@ function handleMessage(data) {
   const t = data.type;
   if (t === 'status') updateStatus(data.status || data);
   else if (t === 'task_event') updateTask(data);
+  else if (t === 'task_list') updateTaskList(data);
+  else if (t === 'task_created') log('INFO', 'Task', `新任务创建: ${data.task?.name || data.task?.id || '?'}`);
+  else if (t === 'action_event') logActionEvent(data);
+  else if (t === 'robot_position') updatePosition(data);
   else if (t === 'obstacle') updateObstacle(data);
   else if (t === 'vision_frame') updateVision(data);
   else if (t === 'error') log('ERROR', 'Server', data.message);
@@ -226,6 +232,35 @@ function updateTask(data) {
   const pct = total > 0 ? (idx / total) * 100 : 0;
   document.getElementById('task-bar').style.width = pct + '%';
   log('INFO', 'Task', `${name} ${event} (${idx}/${total})`);
+}
+
+function updateTaskList(data) {
+  const tasks = data.tasks || [];
+  const running = tasks.find(t => t.status === 'running');
+  if (running) {
+    document.getElementById('task-name').textContent = running.name || running.id;
+    document.getElementById('action-count').textContent = running.current_action_index || 0;
+    document.getElementById('total-actions').textContent = running.actions ? running.actions.length : 0;
+  }
+  log('INFO', 'Task', `任务列表更新: ${tasks.length} 个任务`);
+}
+
+function logActionEvent(data) {
+  const event = data.event || '';
+  const actionType = data.action_type || '';
+  const detail = data.detail || '';
+  const level = event === 'failed' ? 'ERROR' : event === 'completed' ? 'INFO' : 'DEBUG';
+  log(level, 'Action', `[${actionType}] ${event} | ${detail}`);
+}
+
+function updatePosition(data) {
+  const pos = data.position || {};
+  const yaw = data.yaw || 0;
+  const dist = Math.sqrt((pos.x || 0) ** 2 + (pos.y || 0) ** 2);
+  robot.dist = dist;
+  robot.yaw = yaw;
+  document.getElementById('val-dist').textContent = dist.toFixed(1);
+  document.getElementById('val-yaw').textContent = yaw.toFixed(1) + '°';
 }
 
 function updateVision(data) {

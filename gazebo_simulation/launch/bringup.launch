@@ -1,0 +1,62 @@
+<launch>
+  <!-- Gazebo 仿真启动文件 — 一键启动 Gazebo + 机器人 + 桥接
+
+       用法:
+         source /opt/ros/noetic/setup.bash
+         roslaunch gazebo_simulation bringup.launch
+
+       参数:
+         world_file    - Gazebo 世界文件路径
+         robot_urdf    - 机器人 URDF 文件路径
+         gui           - 是否启用 Gazebo GUI，默认 true
+         paused        - 是否暂停启动，默认 false
+         use_sim_time  - 是否使用仿真时间，默认 true
+  -->
+
+  <arg name="world_file" default="$(find gazebo_simulation)/worlds/obstacle_world.world"/>
+  <arg name="robot_urdf" default="$(find gazebo_simulation)/robot_description/urdf/robot.urdf"/>
+  <arg name="gui" default="true"/>
+  <arg name="paused" default="false"/>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="x_pos" default="0.0"/>
+  <arg name="y_pos" default="0.0"/>
+  <arg name="z_pos" default="0.1"/>
+  <arg name="yaw_pos" default="0.0"/>
+
+  <!-- 启动 Gazebo -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world_file)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+  </include>
+
+  <!-- 加载机器人 URDF 到参数服务器 -->
+  <param name="robot_description" textfile="$(arg robot_urdf)" />
+
+  <!-- 发布 TF -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" 
+        respawn="false" output="screen">
+    <param name="publish_frequency" value="50.0"/>
+  </node>
+
+  <!-- 在 Gazebo 中生成机器人（延迟 8 秒，等 Gazebo 模型加载完） -->
+  <node name="spawn_robot" pkg="gazebo_ros" type="spawn_model" 
+        args="-param robot_description
+              -urdf
+              -model robot
+              -x $(arg x_pos)
+              -y $(arg y_pos)
+              -z $(arg z_pos)
+              -Y $(arg yaw_pos)"
+        launch-prefix="bash -c 'sleep 8; $0 $@' "
+        output="screen"/>
+
+  <!-- 启动 Gazebo 桥接脚本（可选，也可手动运行） -->
+  <!-- 注释掉，推荐手动运行以方便查看输出 -->
+  <!--
+  <node name="gazebo_bridge" pkg="gazebo_simulation" type="gazebo_bridge.py"
+        output="screen" launch-prefix=""/>
+  -->
+
+</launch>

@@ -34,14 +34,22 @@
             <label>任务名称</label>
             <input type="text" id="task-name-input" placeholder="例如：去客厅拿杯子" value="避障测试任务" />
           </div>
-          <div class="form-group">
-            <label>优先级</label>
-            <select id="task-priority">
-              <option value="NORMAL">NORMAL</option>
-              <option value="HIGH">HIGH</option>
-              <option value="LOW">LOW</option>
-              <option value="EMERGENCY">EMERGENCY</option>
-            </select>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label>优先级</label>
+              <select id="task-priority">
+                <option value="NORMAL">NORMAL</option>
+                <option value="HIGH">HIGH</option>
+                <option value="LOW">LOW</option>
+                <option value="EMERGENCY">EMERGENCY</option>
+              </select>
+            </div>
+            <div class="form-group checkbox-group">
+              <label class="checkbox-label" title="创建后立即执行；关闭则进入等待队列，由调度器择机执行">
+                <input type="checkbox" id="auto-start-checkbox" checked />
+                <span>立即执行</span>
+              </label>
+            </div>
           </div>
           <div class="form-group">
             <label>动作序列</label>
@@ -66,16 +74,51 @@
         </div>
 
         <div class="panel">
+          <div class="panel-title">
+            调度控制
+            <span class="panel-actions">
+              <span id="auto-schedule-status" class="status-badge auto-on">自动</span>
+            </span>
+          </div>
+          <div class="form-row schedule-controls">
+            <button class="btn-secondary" onclick="toggleAutoSchedule()" id="btn-auto-schedule">关闭自动调度</button>
+            <button class="btn-accent" onclick="startScheduling()">开始调度</button>
+          </div>
+          <p class="hint-text">关闭自动调度后，创建的任务会进入等待队列，点击“开始调度”按优先级执行。</p>
+        </div>
+
+        <div class="panel">
           <div class="panel-title">快捷任务</div>
           <button class="btn-quick" onclick="quickTask('直线行走2m', [{type:'walk_straight',params:{distance:2,speed:0.8}}])">直线行走 2m</button>
           <button class="btn-quick" onclick="quickTask('左转+直行', [{type:'turn_in_place',params:{angle:45,direction:'left',speed:0.3}},{type:'walk_straight',params:{distance:1,speed:0.8}}])">左转 45° + 直行</button>
           <button class="btn-quick" onclick="quickTask('避障绕行', [{type:'avoid_obstacle',params:{}}])">视觉避障</button>
           <button class="btn-quick" onclick="quickTask('紧急停止', [{type:'stop',params:{emergency:true}}])">紧急停止</button>
+          <hr class="quick-divider" />
+          <button class="btn-quick demo" onclick="batchDemoTasks()">🎬 批量调度演示（3个不同优先级任务）</button>
         </div>
       </aside>
 
-      <!-- CENTER: Task List -->
+      <!-- CENTER: Map + Task List -->
       <section class="center">
+        <!-- 实时地图 -->
+        <div class="panel map-panel">
+          <div class="panel-title">
+            实时位置地图
+            <span class="panel-actions">
+              <span id="coord-display">X: 0.00 Y: 0.00 | Yaw: 0° | 总里程: 0.00m</span>
+              <button onclick="resetMap()">重置</button>
+            </span>
+          </div>
+          <div class="map-wrap">
+            <canvas id="map-canvas" width="600" height="350"></canvas>
+            <div class="map-legend">
+              <span><span class="legend-dot robot"></span> 机器人</span>
+              <span><span class="legend-dot trajectory"></span> 轨迹</span>
+              <span><span class="legend-dot target"></span> 目标</span>
+            </div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-title">
             任务队列
@@ -102,6 +145,14 @@
               </tbody>
             </table>
           </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">
+            等待队列（优先级排序）
+            <span class="panel-actions" id="queue-count">0 个</span>
+          </div>
+          <div id="queue-list" class="current-task-steps"></div>
         </div>
 
         <div class="panel">

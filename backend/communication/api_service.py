@@ -1,4 +1,4 @@
-"""统一通信 API：APIService"""
+"""统一通信 API：APIService（v2.0 — 闭环确认版）"""
 import asyncio
 import json
 from typing import Optional, Callable
@@ -10,7 +10,12 @@ from backend.communication.heartbeat_manager import HeartbeatManager
 
 
 class APIService:
-    """统一通信 API，实现 ICommunication 接口，解耦模块依赖"""
+    """统一通信 API，实现 ICommunication 接口，解耦模块依赖
+    
+    v2.0 新增：
+      - action_event 回调：接收机器人动作生命周期事件
+      - robot_position 回调：接收机器人实时坐标
+    """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9090):
         self._socket = SocketClient(host=host, port=port, reconnect_interval=3.0)
@@ -22,10 +27,15 @@ class APIService:
         self._heartbeat.set_ping_callback(self._send_ping)
         self._on_status: Optional[Callable] = None
         self._on_task_event: Optional[Callable] = None
+        self._on_action_event: Optional[Callable] = None  # 新增
+        self._on_position: Optional[Callable] = None      # 新增
 
-    def set_callbacks(self, on_status=None, on_task_event=None):
+    def set_callbacks(self, on_status=None, on_task_event=None,
+                      on_action_event=None, on_position=None):
         self._on_status = on_status
         self._on_task_event = on_task_event
+        self._on_action_event = on_action_event
+        self._on_position = on_position
 
     def connect(self) -> bool:
         ok = self._socket.connect()
@@ -70,6 +80,9 @@ class APIService:
                 self._on_status(msg)
             elif mtype == "task_event" and self._on_task_event:
                 self._on_task_event(msg)
+            elif mtype == "action_event" and self._on_action_event:
+                # 动作生命周期事件：started, progress, completed, failed
+                self._on_action_event(msg)
             elif mtype == "heartbeat":
                 self._heartbeat.on_pong()
         except Exception as e:

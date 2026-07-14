@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Optional, List
 from .models import RobotStatus, Task, Action, Command
+from .enums import TaskPriority
 
 
 class IStatusManager(ABC):
@@ -27,7 +28,9 @@ class ITaskPlanner(ABC):
     """任务规划接口"""
     
     @abstractmethod
-    def create_task(self, name: str, actions: List[Action], priority: str = "NORMAL") -> Task:
+    def create_task(self, name: str, actions: List[Action],
+                    priority: TaskPriority = TaskPriority.NORMAL,
+                    auto_start: Optional[bool] = None) -> Task:
         """创建任务"""
         pass
     

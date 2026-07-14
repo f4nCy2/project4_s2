@@ -1,8 +1,8 @@
-"""WebSocket 服务器（FastAPI）
+"""WebSocket 服务器（FastAPI）— v2.0 闭环任务调度版
 
 架构设计：
   d435i避障算法 → 输出实时控制指令 (steer/speed) → 后端仅转发 → TCP → 机器人底层
-  后端负责任务调度，不直接规划避障路径。
+  后端负责任务调度 + 坐标追踪 + 动作闭环确认。
 
 端点：
   /ws/control  — 机器人控制界面（前端 B1）
@@ -11,8 +11,9 @@
 
 功能：
   - 接收 d435i 实时控制指令 → 直接通过 TCP 转发给机器人
-  - 接收任务创建 → 交给 TaskManager → 调度执行（高层动作）
-  - 接收状态回传 → 广播给所有前端
+  - 接收任务创建 → 交给 TaskManager → 调度执行（高层动作，闭环确认）
+  - 接收状态回传 → 坐标追踪 → 广播给所有前端
+  - 接收 action_event → 通知 ActionScheduler 闭环确认 → 广播给前端
   - 视觉帧 → 广播给控制端
 """
 import asyncio
@@ -40,6 +41,7 @@ from backend.common.models import (
 from backend.common.enums import ActionType, RobotState, TaskPriority
 from backend.task_planner.task_manager import TaskManager
 from backend.task_planner.action_scheduler import ActionScheduler
+from backend.task_planner.position_tracker import PositionTracker
 from backend.task_planner.motion_planner import MotionPlanner
 from backend.communication.api_service import APIService
 
@@ -53,7 +55,7 @@ async def lifespan(app: FastAPI):
         state.apiservice.disconnect()
 
 
-app = FastAPI(title="人形机器人控制中心", description="三层架构控制后端", lifespan=lifespan)
+app = FastAPI(title="人形机器人控制中心 v2.0", description="闭环任务调度后端", lifespan=lifespan)
 
 # ── 挂载静态文件 ──
 app.mount("/control", StaticFiles(directory="frontend/control", html=True), name="control")
@@ -64,12 +66,13 @@ class ServerState:
     def __init__(self):
         self.control_clients: set = set()
         self.scheduler_clients: set = set()
-        self.robot_ws_clients: set = set()  # d435i / 机器人底层
+        self.robot_ws_clients: set = set()
         self.apiservice: Optional[APIService] = None
         self.task_manager: Optional[TaskManager] = None
+        self.position_tracker: Optional[PositionTracker] = None
         self.robot_status = RobotStatus()
         self._seq = 0
-        self._avoidance_mode = False  # 是否由 d435i 接管避障控制
+        self._avoidance_mode = False
 
 state = ServerState()
 
@@ -78,48 +81,52 @@ _B64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
 
 
 def _is_valid_frame(frame: str) -> bool:
-    """校验视频帧 base64 字符串是否合法"""
     if not isinstance(frame, str) or not frame:
         return False
-    if len(frame) > 4 * 1024 * 1024:  # 4MB b64 上限
+    if len(frame) > 4 * 1024 * 1024:
         return False
     if not _B64_RE.match(frame):
         return False
-    # 进一步校验能否解码
     try:
         base64.b64decode(frame, validate=True)
     except Exception:
         return False
     return True
 
+
 # ── 初始化模块 ──
 async def init_modules_async():
-    # 通信层：连接机器人底层 TCP（后台重连，避免阻塞启动）
+    # 通信层：连接机器人底层 TCP
     apiservice = APIService(host=TCP_HOST, port=TCP_PORT)
     print(f"[Server] 机器人 TCP 目标: {TCP_HOST}:{TCP_PORT}")
     apiservice.set_callbacks(
         on_status=lambda msg: asyncio.create_task(_handle_robot_status(msg)),
-        on_task_event=lambda msg: asyncio.create_task(_handle_robot_task_event(msg))
+        on_task_event=lambda msg: asyncio.create_task(_handle_robot_task_event(msg)),
+        on_action_event=lambda msg: asyncio.create_task(_handle_action_event(msg)),
+        on_position=lambda msg: asyncio.create_task(_handle_position_update(msg))
     )
     state.apiservice = apiservice
-    # 在后台任务中尝试连接/重连，不阻塞服务启动
     asyncio.create_task(_connect_apiservice(apiservice))
 
-    # 任务调度层：高层动作序列管理
+    # 坐标追踪
+    position_tracker = PositionTracker()
+    position_tracker.subscribe(lambda payload: asyncio.create_task(_broadcast_position(payload)))
+    state.position_tracker = position_tracker
+
+    # 任务调度层：高层动作序列管理（闭环确认）
     scheduler = ActionScheduler(command_sender=apiservice)
     task_manager = TaskManager(scheduler=scheduler)
     task_manager.subscribe_task_events(lambda evt: asyncio.create_task(_broadcast_task_event(evt)))
     state.task_manager = task_manager
 
     print("[Server] 所有后端模块初始化完成")
-    print("[Server] 避障架构: d435i → VFH → 控制指令 → 后端转发 → TCP → 机器人底层")
-    print("[Server] 后端不规划避障路径，只做指令转发和任务调度")
+    print("[Server] 闭环架构: d435i避障 → 后端转发 → TCP → 机器人底层")
+    print("[Server] 任务调度: 动作发送 → 机器人执行 → action_event 回传 → 闭环确认 → 下一动作")
 
 
 async def _connect_apiservice(apiservice: APIService):
     """后台持续重连机器人 TCP，直到成功"""
     while True:
-        # 如果 on_dead 已经重连成功，直接退出
         if apiservice.is_connected():
             print("[Server] 机器人 TCP 连接成功 (由 on_dead 重连)")
             break
@@ -131,34 +138,86 @@ async def _connect_apiservice(apiservice: APIService):
         await asyncio.sleep(3.0)
 
 
+# ── 机器人消息处理 ──
+
 async def _handle_robot_status(msg):
     """处理机器人底层状态上报"""
     raw = msg.get("status", {})
 
-    # 兼容数组格式的 position/orientation（robot_simulator.py 发送 [x,y] / [r,p,y]）
+    # 兼容数组格式的 position/orientation
     def _normalize(val, keys):
         if isinstance(val, list):
             return dict(zip(keys, val))
         return val
 
-    raw = dict(raw)  # 避免修改原 dict
+    raw = dict(raw)
     raw["position"] = _normalize(raw.get("position"), ["x", "y", "z"])
     raw["orientation"] = _normalize(raw.get("orientation"), ["roll", "pitch", "yaw"])
 
+    # 更新坐标追踪
+    if state.position_tracker:
+        state.position_tracker.update_from_status(raw)
+
+    # 更新状态
     status = RobotStatus(**raw)
     state.robot_status = status
-    await _broadcast_control({"type": "status", "status": status.model_dump()})
+    await _broadcast_control({"type": "status", "status": status.model_dump(mode='json')})
 
 
 async def _handle_robot_task_event(msg):
     """处理机器人任务事件"""
-    await _broadcast_scheduler({"type": "task_event", **msg})
+    await _broadcast_all({"type": "task_event", **msg})
+
+
+async def _handle_action_event(msg):
+    """处理机器人动作生命周期事件（闭环确认）"""
+    # 转发给 TaskManager 进行闭环确认
+    if state.task_manager:
+        state.task_manager.on_action_event(msg)
+
+    # 更新坐标追踪
+    if state.position_tracker:
+        state.position_tracker.update_from_action_event(msg)
+
+    # 广播给所有前端（双向同步）
+    await _broadcast_all({"type": "action_event", **msg})
+
+    # 日志
+    event = msg.get("event", "")
+    action_type = msg.get("action_type", "")
+    detail = msg.get("detail", "")
+    pos = msg.get("position", {})
+    print(f"[Server] action_event: {event} | {action_type} | {detail} | pos=({pos.get('x', 0):.2f}, {pos.get('y', 0):.2f})")
+
+
+async def _handle_position_update(msg):
+    """处理坐标更新（由 PositionTracker 回调触发）"""
+    # 已通过 subscribe 直接广播，这里不需要额外处理
+    pass
+
+
+async def _broadcast_all(payload: dict):
+    """广播给所有前端（控制端 + 调度端）"""
+    dead = []
+    data = json.dumps(payload, ensure_ascii=False)
+    for ws in list(state.control_clients | state.scheduler_clients):
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.control_clients.discard(ws)
+        state.scheduler_clients.discard(ws)
+
+
+async def _broadcast_position(payload: dict):
+    """广播坐标给所有前端"""
+    await _broadcast_all(payload)
 
 
 async def _broadcast_task_event(evt: dict):
     """广播任务事件给所有前端"""
-    await _broadcast_control({"type": "task_event", **evt})
-    await _broadcast_scheduler({"type": "task_event", **evt})
+    await _broadcast_all({"type": "task_event", **evt})
 
 
 async def _broadcast_vision(data: dict):
@@ -173,7 +232,7 @@ async def _broadcast_vision(data: dict):
 async def _broadcast_control(payload: dict):
     """广播给控制端"""
     dead = []
-    data = json.dumps(payload, ensure_ascii=False, default=str)
+    data = json.dumps(payload, ensure_ascii=False)
     for ws in state.control_clients:
         try:
             await ws.send_text(data)
@@ -186,7 +245,7 @@ async def _broadcast_control(payload: dict):
 async def _broadcast_scheduler(payload: dict):
     """广播给调度端"""
     dead = []
-    data = json.dumps(payload, ensure_ascii=False, default=str)
+    data = json.dumps(payload, ensure_ascii=False)
     for ws in state.scheduler_clients:
         try:
             await ws.send_text(data)
@@ -205,6 +264,17 @@ async def ws_control(websocket: WebSocket):
     state.control_clients.add(websocket)
     await websocket.send_json({"type": "connected", "role": "control"})
     print(f"[WS] 控制端已连接，当前 {len(state.control_clients)} 个")
+
+    # 发送当前状态
+    await websocket.send_json({"type": "status", "status": state.robot_status.model_dump(mode='json')})
+    # 发送当前坐标
+    if state.position_tracker and state.position_tracker.get_position():
+        await websocket.send_json({
+            "type": "robot_position",
+            "position": state.position_tracker.get_position(),
+            "yaw": state.position_tracker.get_yaw(),
+            "trajectory": state.position_tracker.get_trajectory()
+        })
 
     try:
         while True:
@@ -228,8 +298,34 @@ async def ws_scheduler(websocket: WebSocket):
     tasks = state.task_manager.get_all_tasks() if state.task_manager else []
     await websocket.send_json({
         "type": "task_list",
-        "tasks": [t.model_dump() for t in tasks]
+        "tasks": [t.model_dump(mode='json') for t in tasks]
     })
+
+    # 发送当前等待队列与自动调度状态
+    if state.task_manager:
+        queue_tasks = []
+        for tid in state.task_manager.get_queue():
+            t = state.task_manager.get_task(tid)
+            if t and t.status in (TaskStatus.PENDING, TaskStatus.PAUSED):
+                queue_tasks.append(t.model_dump(mode='json'))
+        await websocket.send_json({
+            "type": "queue_changed",
+            "queue": queue_tasks,
+            "queue_length": len(queue_tasks)
+        })
+        await websocket.send_json({
+            "type": "auto_schedule_changed",
+            "enabled": state.task_manager.is_auto_schedule()
+        })
+
+    # 发送当前坐标
+    if state.position_tracker and state.position_tracker.get_position():
+        await websocket.send_json({
+            "type": "robot_position",
+            "position": state.position_tracker.get_position(),
+            "yaw": state.position_tracker.get_yaw(),
+            "trajectory": state.position_tracker.get_trajectory()
+        })
 
     try:
         while True:
@@ -245,11 +341,6 @@ async def ws_scheduler(websocket: WebSocket):
 async def ws_robot(websocket: WebSocket):
     """
     机器人底层 / d435i 连接的 WebSocket 端点。
-
-    接收：
-      - d435i 发来的 control_cmd: { "type": "control_cmd", "steer": 5.0, "speed": 0.3 }
-        → 后端直接转发给 TCP 机器人底层，不修改指令
-      - 机器人底层状态回传
     """
     await websocket.accept()
     state.robot_ws_clients.add(websocket)
@@ -263,68 +354,51 @@ async def ws_robot(websocket: WebSocket):
                 msg = json.loads(raw)
                 mtype = msg.get("type", "")
 
-                # ── d435i 发来的实时控制指令 ──
+                # d435i 发来的实时控制指令
                 if mtype == "control_cmd":
                     steer = msg.get("steer")
                     speed = msg.get("speed")
                     source = msg.get("source", "unknown")
-
-                    # 直接转发给 TCP 机器人底层
                     if state.apiservice:
                         await _forward_d435i_control(steer, speed, source)
-
-                    # 同时广播给控制端，让前端显示 d435i 的实时决策
                     await _broadcast_control({
                         "type": "d435i_control",
-                        "steer": steer,
-                        "speed": speed,
-                        "source": source,
+                        "steer": steer, "speed": speed, "source": source,
                         "timestamp": msg.get("timestamp", time.time())
                     })
                     continue
 
-                # ── d435i 发来的视觉帧 ──
+                # d435i 发来的视觉帧
                 if mtype == "vision_frame":
                     frame_b64 = msg.get("frame", "")
                     if _is_valid_frame(frame_b64):
                         await _broadcast_vision({"frame": frame_b64, "type": "vision_frame"})
-                    else:
-                        print(f"[WS/robot] ⚠️ 收到非法视频帧，长度={len(frame_b64) if isinstance(frame_b64, str) else 'N/A'}，已丢弃")
                     continue
 
-                # ── d435i 注册消息 ──
+                # d435i 注册消息
                 if mtype == "register":
                     role = msg.get("role", "")
                     print(f"[WS/robot] 注册: {role}")
                     await websocket.send_json({"type": "registered", "role": role})
                     continue
 
-                # ── 机器人底层状态回传 ──
+                # 机器人底层状态回传
                 task_id = int(msg.get("task_id", -1))
                 status = str(msg.get("status", "RUNNING"))
                 step_id = msg.get("step_id")
 
-                # 广播给前端
                 await _broadcast_control({
                     "type": "robot_step_status",
-                    "task_id": task_id,
-                    "step_id": step_id,
-                    "status": status,
-                    "detail": msg.get("detail", "")
+                    "task_id": task_id, "step_id": step_id,
+                    "status": status, "detail": msg.get("detail", "")
                 })
-
-                # 回执 ack
-                await websocket.send_json({
-                    "type": "ack",
-                    "task_id": task_id,
-                    "status": status
-                })
+                await websocket.send_json({"type": "ack", "task_id": task_id, "status": status})
 
             except Exception as e:
                 await websocket.send_json({"type": "error", "message": str(e)})
 
     except WebSocketDisconnect as e:
-        print(f"[WS] 机器人端断开: code={e.code}, reason={e.reason}")
+        print(f"[WS] 机器人端断开: code={e.code}")
     except Exception as e:
         print(f"[WS] 机器人端异常断开: {type(e).__name__}: {e}")
     finally:
@@ -333,24 +407,18 @@ async def ws_robot(websocket: WebSocket):
 
 
 async def _forward_d435i_control(steer, speed, source):
-    """
-    将 d435i 的实时控制指令直接转发给 TCP 机器人底层。
-    后端不修改、不规划，只做透明转发。
-    """
+    """将 d435i 的实时控制指令直接转发给 TCP 机器人底层"""
     if not state.apiservice:
         return
-    # 构造底层控制消息（与机器人底层协议对齐）
     cmd = {
         "type": "low_level_control",
         "source": source,
-        "steer": steer,    # 转向角度 (度)
-        "speed": speed,    # 线速度 (m/s)
+        "steer": steer,
+        "speed": speed,
         "timestamp": time.time()
     }
-    # 通过 TCP 发送（4 字节长度前缀 + JSON Body）
     data = json.dumps(cmd, ensure_ascii=False).encode("utf-8")
     state.apiservice.send_raw(data)
-    # 不等待回包，d435i 是高频实时控制，不需要确认
 
 
 async def _handle_control_message(msg: dict):
@@ -358,17 +426,22 @@ async def _handle_control_message(msg: dict):
     mtype = msg.get("type", "")
 
     if mtype == "command":
-        # 高层动作指令（来自前端手动控制）
         action = msg.get("action", "")
         params = msg.get("params", {})
         if state.apiservice:
             state.apiservice.send_action(action, params)
 
     elif mtype == "task_control":
-        # 任务控制
         cmd = msg.get("command", "")
         task_id = msg.get("task_id", "")
         if not state.task_manager:
+            return
+        # 控制面板使用 'current' 表示当前任务
+        if task_id == "current" or not task_id:
+            current = state.task_manager.get_current_task()
+            task_id = current.id if current else None
+        if not task_id:
+            print("[Server] WARN: 没有可控制的任务")
             return
         if cmd == "start":
             state.task_manager.start_task(task_id)
@@ -388,13 +461,16 @@ async def _handle_control_message(msg: dict):
     elif mtype == "heartbeat":
         await _broadcast_control({"type": "heartbeat", "seq": msg.get("seq", 0)})
 
+    elif mtype == "get_tasks":
+        tasks = state.task_manager.get_all_tasks() if state.task_manager else []
+        await _broadcast_all({"type": "task_list", "tasks": [t.model_dump(mode='json') for t in tasks]})
+
 
 async def _handle_scheduler_message(msg: dict):
     """处理调度端消息"""
     mtype = msg.get("type", "")
 
     if mtype == "create_task":
-        # 创建任务
         name = msg.get("name", "新任务")
         actions_data = msg.get("actions", [])
         priority_str = msg.get("priority", "NORMAL")
@@ -412,14 +488,30 @@ async def _handle_scheduler_message(msg: dict):
                 params=ActionParams(**a.get("params", {}))
             ))
 
-        task = state.task_manager.create_task(name=name, actions=actions, priority=priority)
-        await _broadcast_scheduler({
-            "type": "task_created",
-            "task": task.model_dump()
-        })
+        auto_start = msg.get("auto_start")
+        task = state.task_manager.create_task(
+            name=name, actions=actions, priority=priority, auto_start=auto_start
+        )
+        await _broadcast_all({"type": "task_created", "task": task.model_dump(mode='json')})
 
     elif mtype == "start_task":
         state.task_manager.start_task(msg.get("task_id", ""))
+
+    elif mtype == "start_scheduling":
+        next_id = state.task_manager.start_scheduling()
+        await _broadcast_all({
+            "type": "scheduling_started",
+            "next_task_id": next_id,
+            "has_task": next_id is not None
+        })
+
+    elif mtype == "set_auto_schedule":
+        enabled = bool(msg.get("enabled", True))
+        state.task_manager.set_auto_schedule(enabled)
+        await _broadcast_all({
+            "type": "auto_schedule_changed",
+            "enabled": enabled
+        })
 
     elif mtype == "stop_task":
         state.task_manager.stop_task(msg.get("task_id", ""))
@@ -435,10 +527,13 @@ async def _handle_scheduler_message(msg: dict):
 
     elif mtype == "get_tasks":
         tasks = state.task_manager.get_all_tasks()
-        await _broadcast_scheduler({
-            "type": "task_list",
-            "tasks": [t.model_dump() for t in tasks]
-        })
+        await _broadcast_all({"type": "task_list", "tasks": [t.model_dump(mode='json') for t in tasks]})
+
+    elif mtype == "reset_position":
+        # 重置坐标追踪
+        if state.position_tracker:
+            state.position_tracker.reset()
+        await _broadcast_all({"type": "position_reset"})
 
 
 # ── HTTP API ──
@@ -447,9 +542,10 @@ async def _handle_scheduler_message(msg: dict):
 async def root():
     return """
     <html><body style="font-family:Arial;padding:40px">
-        <h1>人形机器人控制中心</h1>
-        <p>后端服务运行中</p>
+        <h1>人形机器人控制中心 v2.0</h1>
+        <p>后端服务运行中（闭环任务调度版）</p>
         <p>架构：d435i避障 → 后端转发 → TCP → 机器人底层</p>
+        <p>闭环：动作发送 → 机器人执行 → action_event 回传 → 确认 → 下一动作</p>
         <ul>
             <li><a href="/control">控制界面</a></li>
             <li><a href="/scheduler">任务调度</a></li>
@@ -460,7 +556,7 @@ async def root():
 @app.get("/api/status")
 async def api_status():
     """获取当前机器人状态"""
-    return {"success": True, "status": state.robot_status.model_dump()}
+    return {"success": True, "status": state.robot_status.model_dump(mode='json')}
 
 @app.get("/api/tasks")
 async def api_tasks():
@@ -468,13 +564,25 @@ async def api_tasks():
     if not state.task_manager:
         return {"success": False, "tasks": []}
     tasks = state.task_manager.get_all_tasks()
-    return {"success": True, "tasks": [t.model_dump() for t in tasks]}
+    return {"success": True, "tasks": [t.model_dump(mode='json') for t in tasks]}
+
+@app.get("/api/position")
+async def api_position():
+    """获取当前坐标和轨迹"""
+    if not state.position_tracker:
+        return {"success": False}
+    return {
+        "success": True,
+        "position": state.position_tracker.get_position(),
+        "yaw": state.position_tracker.get_yaw(),
+        "trajectory": state.position_tracker.get_trajectory(),
+        "total_distance": state.position_tracker.get_total_distance()
+    }
 
 
 # ── 入口 ──
 
 if __name__ == "__main__":
     import uvicorn
-    # ws_max_size: 允许前后端之间传输大视频帧（单位：字节）
     WS_MAX_SIZE = int(os.getenv("WS_MAX_SIZE", str(8 * 1024 * 1024)))
     uvicorn.run(app, host=WS_HOST, port=WS_PORT, ws_max_size=WS_MAX_SIZE)

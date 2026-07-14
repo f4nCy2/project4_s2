@@ -6,7 +6,7 @@ WS_HOST = os.getenv("WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("WS_PORT", "8080"))
 
 # TCP 通信（机器人底层）
-TCP_HOST = os.getenv("TCP_HOST", "192.168.1.2")
+TCP_HOST = os.getenv("TCP_HOST", "192.168.1.179")
 TCP_PORT = int(os.getenv("TCP_PORT", "9090"))
 
 # 心跳
